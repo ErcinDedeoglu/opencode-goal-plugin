@@ -152,7 +152,7 @@ OpenCode Plan mode is a user-controlled safety boundary, and goal mode must not 
 - Automatic idle continuation is suppressed while the last user prompt or the latest assistant turn came from a restricted agent. If a previously active goal idles under Plan mode, it is paused visibly instead of continuing autonomously.
 - Resuming a goal (`update_goal_status` with `active`, or `update_goal_objective` with `status: "active"`) is refused from Plan mode, so a prompt-injected instruction inside repository content cannot self-escalate a planning session into Build-mode execution. Switching to Build mode and resuming is an explicit user action; resuming from Build updates the tracked agent so continuation restarts pinned to Build.
 - Continuation prompts are pinned to the agent recorded from the last user prompt (`body.agent`), so auto-continue never silently switches the session to a different agent or mode.
-- After a Plan-mode prompt, active or paused goals receive a cache-stable planning reminder with the objective and configured limits but no implementation work. Safety-limited goals keep their distinct status and wrap-up guidance while adding the Plan-mode constraint.
+- Every session receives the same compact Goal Mode system policy, regardless of whether a goal exists or which lifecycle state it is in. Dynamic objectives, limits, counters, and stop details stay in goal-tool results, continuation prompts, and compaction context; Plan-mode and safety-limit enforcement remains server-side.
 
 The set of planning-only agents is configurable with `restricted_agents` (default `["plan"]`). Setting `allow_goal_execution_from_plan` to `true` opts out of all of these restrictions; the secure default is `false`.
 
