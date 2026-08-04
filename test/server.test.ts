@@ -1,8 +1,13 @@
 import { afterEach, beforeEach, expect, setSystemTime, test } from "bun:test"
-import { mkdtemp, rm } from "node:fs/promises"
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import plugin from "../src/server"
+import {
+  getGoal,
+  recordContinuationResult,
+  reserveContinuation,
+} from "../src/state"
 
 function requireTool<T>(tool: T | undefined, name: string): T {
   if (!tool) throw new Error(`expected ${name} to be registered`)
@@ -16,6 +21,15 @@ async function waitFor(predicate: () => boolean) {
     await new Promise((resolve) => setTimeout(resolve, 5))
   }
   expect(predicate()).toBe(true)
+}
+
+async function waitForLong(predicate: () => boolean | Promise<boolean>, deadlineMs = 3000) {
+  const deadline = Date.now() + deadlineMs
+  while (Date.now() < deadline) {
+    if (await predicate()) return
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  expect(await predicate()).toBe(true)
 }
 
 async function waitForContinuation(calls: unknown[]) {
@@ -274,6 +288,20 @@ OpenCode goal mode policy:
       usageContext,
     )
     await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_usage" } } as never })
+    // The continuation turn completes with a real assistant message, which
+    // resolves the pending continuation; the next idle then consumes the
+    // auto-turn limit and requests the wrap-up.
+    await hooks["experimental.chat.messages.transform"]!(
+      {},
+      {
+        messages: [
+          {
+            info: { id: "msg_usage_turn", role: "assistant", sessionID: "ses_usage" },
+            parts: [{ type: "text", text: "USAGE_TURN_SHOULD_NOT_LEAK" }],
+          },
+        ],
+      } as never,
+    )
     await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_usage" } } as never })
     const usageLimited = await requireTool(tools.get_goal, "get_goal").execute({}, usageContext)
     expect(String(usageLimited)).toContain('"status": "usageLimited"')
@@ -616,7 +644,7 @@ test("turn watchdog retries a busy active goal without consuming continuation bu
         },
       },
     } as never,
-    { auto_continue: false, max_turn_time: 0.02, max_auto_turns: 1, max_prompt_failures: 1 },
+    { auto_continue: false, max_turn_time: 0.02, max_auto_turns: 1, max_prompt_failures: 5 },
   )
   const tools = hooks.tool
   if (!tools) throw new Error("expected goal tools to be registered")
@@ -638,11 +666,27 @@ test("turn watchdog retries a busy active goal without consuming continuation bu
   expect(String(read)).toContain('"autoTurns": 0')
   expect(String(read)).toContain('"continuationFailures": 0')
   expect(String(read)).toContain('"awaitingContinuationProgress": false')
+  // A watchdog-delivered prompt is already inside a busy episode, so the
+  // pending attempt is marked started immediately.
+  expect(String(read)).toContain('"pendingContinuationStarted": true')
 
+  // The busy episode ends. Auto-continue is disabled here, so nothing further
+  // happens on idle; the watchdog-delivered attempt stays pending and started.
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+  const afterIdle = await requireTool(tools.get_goal, "get_goal").execute({}, context)
+  expect(String(afterIdle)).toContain('"status": "active"')
+  expect(String(afterIdle)).toContain('"autoTurns": 0')
+  expect(String(afterIdle)).toContain('"continuationFailures": 1')
+  expect(String(afterIdle)).toContain('"pendingContinuationStart": null')
+
+  // A new busy episode rescues again, still without auto-turn budgets.
   await hooks.event!({
     event: { type: "session.status", properties: { sessionID: "ses_1", status: { type: "busy" } } } as never,
   })
   await waitFor(() => calls.length === 2)
+  const final = await requireTool(tools.get_goal, "get_goal").execute({}, context)
+  expect(String(final)).toContain('"status": "active"')
+  expect(String(final)).toContain('"autoTurns": 0')
 })
 
 test("turn watchdog resets when another busy turn starts", async () => {
@@ -787,7 +831,7 @@ test("turn watchdog does not inject while tasks are active, the goal is paused, 
   expect(calls).toHaveLength(0)
 })
 
-test("turn watchdog transport failures do not pause or charge the goal", async () => {
+test("turn watchdog transport failures share the prompt-failure ceiling without charging auto-turns", async () => {
   const logs: unknown[] = []
   const hooks = await plugin.server(
     {
@@ -800,7 +844,7 @@ test("turn watchdog transport failures do not pause or charge the goal", async (
         },
       },
     } as never,
-    { auto_continue: false, max_turn_time: 0.02, max_prompt_failures: 1 },
+    { auto_continue: false, max_turn_time: 0.02, max_prompt_failures: 2 },
   )
   const tools = hooks.tool
   if (!tools) throw new Error("expected goal tools to be registered")
@@ -812,11 +856,32 @@ test("turn watchdog transport failures do not pause or charge the goal", async (
   })
   await waitFor(() => logs.length === 1)
 
-  const read = await requireTool(tools.get_goal, "get_goal").execute({}, context)
-  expect(String(read)).toContain('"status": "active"')
-  expect(String(read)).toContain('"autoTurns": 0')
-  expect(String(read)).toContain('"continuationFailures": 0')
+  const afterFirst = await requireTool(tools.get_goal, "get_goal").execute({}, context)
+  expect(String(afterFirst)).toContain('"status": "active"')
+  expect(String(afterFirst)).toContain('"autoTurns": 0')
+  expect(String(afterFirst)).toContain('"continuationFailures": 1')
   expect(JSON.stringify(logs[0])).toContain("Turn watchdog retry failed")
+
+  // Duplicate busy notifications in the same episode cannot re-arm a failed
+  // rescue.
+  await hooks.event!({
+    event: { type: "session.status", properties: { sessionID: "ses_1", status: { type: "busy" } } } as never,
+  })
+  await new Promise((resolve) => setTimeout(resolve, 80))
+  expect(logs).toHaveLength(1)
+
+  // A new busy episode gets one rescue; its failure reaches the ceiling.
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+  await hooks.event!({
+    event: { type: "session.status", properties: { sessionID: "ses_1", status: { type: "busy" } } } as never,
+  })
+  await waitFor(() => logs.length === 2)
+
+  const read = await requireTool(tools.get_goal, "get_goal").execute({}, context)
+  expect(String(read)).toContain('"status": "paused"')
+  expect(String(read)).toContain('"autoTurns": 0')
+  expect(String(read)).toContain('"continuationFailures": 2')
+  expect(String(read)).toContain("Auto-continue prompt failed repeatedly")
 })
 
 test("running task defers idle auto-continue", async () => {
@@ -1661,4 +1726,809 @@ test("idle handler skips overlapping continuations for the same session", async 
   await first
 
   expect(calls).toHaveLength(1)
+})
+
+test("auto-continue retries are bounded: three failed attempts, no fourth", async () => {
+  const logs: unknown[] = []
+  const hooks = await plugin.server(
+    {
+      client: {
+        app: { log: async (input: unknown) => logs.push(input) },
+        session: {
+          promptAsync: async () => {
+            throw new Error("network down")
+          },
+        },
+      },
+    } as never,
+    { auto_continue: true, max_auto_turns: 10, min_continue_interval_seconds: 0, max_prompt_failures: 3 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, { sessionID: "ses_1" } as never)
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+
+  await waitForLong(() => logs.length === 3)
+  await new Promise((resolve) => setTimeout(resolve, 300))
+
+  const read = await requireTool(tools.get_goal, "get_goal").execute({}, { sessionID: "ses_1" } as never)
+  expect(String(read)).toContain('"status": "paused"')
+  expect(String(read)).toContain('"continuationFailures": 3')
+  expect(String(read)).toContain('"autoTurns": 3')
+  expect(logs).toHaveLength(3)
+})
+
+test("failed continuation retries wait for the configured minimum interval", async () => {
+  const logs: unknown[] = []
+  const hooks = await plugin.server(
+    {
+      client: {
+        app: { log: async (input: unknown) => logs.push(input) },
+        session: {
+          promptAsync: async () => {
+            throw new Error("fetch failed")
+          },
+        },
+      },
+    } as never,
+    { auto_continue: true, max_auto_turns: 5, min_continue_interval_seconds: 1, max_prompt_failures: 2 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, { sessionID: "ses_1" } as never)
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+  await waitFor(() => logs.length === 1)
+
+  const early = await requireTool(tools.get_goal, "get_goal").execute({}, { sessionID: "ses_1" } as never)
+  expect(String(early)).toContain('"continuationFailures": 1')
+
+  await new Promise((resolve) => setTimeout(resolve, 400))
+  const beforeInterval = await requireTool(tools.get_goal, "get_goal").execute({}, { sessionID: "ses_1" } as never)
+  expect(String(beforeInterval)).toContain('"continuationFailures": 1')
+
+  await waitForLong(() => logs.length === 2)
+  const read = await requireTool(tools.get_goal, "get_goal").execute({}, { sessionID: "ses_1" } as never)
+  expect(String(read)).toContain('"status": "paused"')
+  expect(String(read)).toContain('"continuationFailures": 2')
+})
+
+test("recognized transport error strings accumulate as continuation failures", async () => {
+  const errors = [
+    "network down",
+    "fetch failed",
+    "ECONNRESET: connection reset by peer",
+    "request timed out",
+    "Cannot connect to API: The socket connection was closed unexpectedly.",
+    "Provider response headers timed out after 10000ms",
+  ]
+  for (const [index, message] of errors.entries()) {
+    const hooks = await plugin.server(
+      {
+        client: {
+          session: {
+            promptAsync: async () => {
+              throw new Error(message)
+            },
+          },
+        },
+      } as never,
+      { auto_continue: true, max_auto_turns: 5, min_continue_interval_seconds: 0, max_prompt_failures: 10 },
+    )
+    const tools = hooks.tool
+    if (!tools) throw new Error("expected goal tools to be registered")
+
+    await requireTool(tools.create_goal, "create_goal").execute(
+      { objective: "keep going" },
+      { sessionID: `ses_transport_${index}` } as never,
+    )
+    await hooks.event!({
+      event: { type: "session.idle", properties: { sessionID: `ses_transport_${index}` } } as never,
+    })
+
+    const read = await requireTool(tools.get_goal, "get_goal").execute({}, { sessionID: `ses_transport_${index}` } as never)
+    expect(String(read)).toContain('"continuationFailures": 1')
+  }
+})
+
+test("failed tool output does not reset prompt failures; successful tool output does", async () => {
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async () => {},
+        },
+      },
+    } as never,
+    { auto_continue: false },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  const context = { sessionID: "ses_1" } as never
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, context)
+  await recordContinuationResult("ses_1", "failure", 5)
+  await recordContinuationResult("ses_1", "success", 5)
+  expect((await getGoal("ses_1"))?.continuationFailures).toBe(1)
+
+  await hooks["tool.execute.after"]!(
+    { tool: "bash", sessionID: "ses_1", callID: "call_1", args: {} } as never,
+    { title: "bash", output: "<error>command not found</error>", metadata: {} } as never,
+  )
+  const afterFailedTool = await requireTool(tools.get_goal, "get_goal").execute({}, context)
+  expect(String(afterFailedTool)).toContain('"continuationFailures": 1')
+
+  await hooks["tool.execute.after"]!(
+    { tool: "bash", sessionID: "ses_1", callID: "call_2", args: {} } as never,
+    { title: "bash", output: "tests passed", metadata: {} } as never,
+  )
+  const afterSuccessfulTool = await requireTool(tools.get_goal, "get_goal").execute({}, context)
+  expect(String(afterSuccessfulTool)).toContain('"continuationFailures": 0')
+  expect(String(afterSuccessfulTool)).toContain('"pendingContinuationStart": null')
+})
+
+test("duplicate idle events before any busy never count a failure or send a duplicate", async () => {
+  const calls: unknown[] = []
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+          },
+        },
+      },
+    } as never,
+    { auto_continue: true, max_auto_turns: 5, min_continue_interval_seconds: 0, max_prompt_failures: 1 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  const context = { sessionID: "ses_1" } as never
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, context)
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+  // Paired duplicate idle: the continuation prompt was delivered but no busy
+  // event has marked it started, so it must neither count an unresolved
+  // failure nor send a second prompt.
+  await hooks.event!({
+    event: { type: "session.status", properties: { sessionID: "ses_1", status: { type: "idle" } } } as never,
+  })
+
+  expect(calls).toHaveLength(1)
+  const read = await requireTool(tools.get_goal, "get_goal").execute({}, context)
+  expect(String(read)).toContain('"status": "active"')
+  expect(String(read)).toContain('"continuationFailures": 0')
+  expect(String(read)).toContain('"pendingContinuationStarted": false')
+  expect(String(read)).not.toContain('"pendingContinuationStart": null')
+})
+
+test("paired idle events after a busy count exactly one unresolved failure and pause at the ceiling", async () => {
+  const calls: unknown[] = []
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+          },
+        },
+      },
+    } as never,
+    { auto_continue: true, max_auto_turns: 5, min_continue_interval_seconds: 0, max_prompt_failures: 1 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  const context = { sessionID: "ses_1" } as never
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, context)
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+  expect(calls).toHaveLength(1)
+
+  // The provider picks up the prompt: the busy event marks the attempt started.
+  await hooks.event!({
+    event: { type: "session.status", properties: { sessionID: "ses_1", status: { type: "busy" } } } as never,
+  })
+  const started = await requireTool(tools.get_goal, "get_goal").execute({}, context)
+  expect(String(started)).toContain('"pendingContinuationStarted": true')
+
+  // The following logical idle has no substantive progress: exactly one
+  // unresolved failure is counted, which hits the ceiling and pauses.
+  await hooks.event!({
+    event: { type: "session.status", properties: { sessionID: "ses_1", status: { type: "idle" } } } as never,
+  })
+  const afterIdle = await requireTool(tools.get_goal, "get_goal").execute({}, context)
+  expect(String(afterIdle)).toContain('"status": "paused"')
+  expect(String(afterIdle)).toContain('"continuationFailures": 1')
+  expect(String(afterIdle)).toContain('"autoTurns": 1')
+
+  // The paired session.idle duplicate must not double-count or double-send.
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+  const final = await requireTool(tools.get_goal, "get_goal").execute({}, context)
+  expect(String(final)).toContain('"continuationFailures": 1')
+  expect(calls).toHaveLength(1)
+})
+
+test("concurrent session.error transport events count at most one failure per pending attempt", async () => {
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async () => {},
+        },
+      },
+    } as never,
+    { auto_continue: false, max_prompt_failures: 3 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  const context = { sessionID: "ses_1" } as never
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, context)
+  await reserveContinuation("ses_1", 10, 0)
+  await recordContinuationResult("ses_1", "success", 3)
+  expect((await getGoal("ses_1"))?.pendingContinuationStart).not.toBeNull()
+
+  const transportEvent = {
+    event: {
+      type: "session.error",
+      properties: {
+        sessionID: "ses_1",
+        error: { name: "AI_APICallError", message: "Cannot connect to API: The socket connection was closed unexpectedly." },
+      },
+    } as never,
+  }
+  await Promise.all([hooks.event!(transportEvent), hooks.event!(transportEvent)])
+  const afterFirst = await requireTool(tools.get_goal, "get_goal").execute({}, context)
+  expect(String(afterFirst)).toContain('"status": "active"')
+  expect(String(afterFirst)).toContain('"continuationFailures": 1')
+
+  // With no pending attempt left, duplicate transport events must not
+  // increment the counter repeatedly.
+  await hooks.event!({
+    event: {
+      type: "session.error",
+      properties: {
+        sessionID: "ses_1",
+        error: { name: "ProviderHeaderTimeoutError", message: "Provider response headers timed out after 10000ms" },
+      },
+    } as never,
+  })
+  await hooks.event!({
+    event: {
+      type: "session.error",
+      properties: {
+        sessionID: "ses_1",
+        error: { name: "ProviderHeaderTimeoutError", message: "Provider response headers timed out after 10000ms" },
+      },
+    } as never,
+  })
+  const final = await requireTool(tools.get_goal, "get_goal").execute({}, context)
+  expect(String(final)).toContain('"continuationFailures": 1')
+})
+
+test("auto_continue false never schedules a retry after a transport event", async () => {
+  const calls: unknown[] = []
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+          },
+        },
+      },
+    } as never,
+    { auto_continue: false, min_continue_interval_seconds: 0, max_prompt_failures: 3 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  const context = { sessionID: "ses_no_auto" } as never
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, context)
+  await reserveContinuation("ses_no_auto", 10, 0)
+  await recordContinuationResult("ses_no_auto", "success", 3)
+  await hooks.event!({
+    event: {
+      type: "session.error",
+      properties: { sessionID: "ses_no_auto", error: { message: "network connection failed" } },
+    } as never,
+  })
+
+  await new Promise((resolve) => setTimeout(resolve, 100))
+  expect(calls).toHaveLength(0)
+  expect((await getGoal("ses_no_auto"))?.continuationFailures).toBe(1)
+})
+
+test("a repeated old assistant message cannot hide a no-response failure", async () => {
+  const calls: unknown[] = []
+  const oldAssistant = {
+    info: { id: "msg_old", role: "assistant", sessionID: "ses_old_message" },
+    parts: [{ type: "text", text: "Earlier progress" }],
+  }
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          messages: async () => ({ data: [oldAssistant] }),
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+          },
+        },
+      },
+    } as never,
+    { auto_continue: true, min_continue_interval_seconds: 0, max_prompt_failures: 1 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+  const context = { sessionID: "ses_old_message" } as never
+
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, context)
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_old_message" } } as never })
+  expect(calls).toHaveLength(1)
+  await hooks.event!({
+    event: { type: "session.status", properties: { sessionID: "ses_old_message", status: { type: "busy" } } } as never,
+  })
+  await hooks.event!({
+    event: { type: "session.status", properties: { sessionID: "ses_old_message", status: { type: "idle" } } } as never,
+  })
+
+  const result = await getGoal("ses_old_message")
+  expect(result?.status).toBe("paused")
+  expect(result?.continuationFailures).toBe(1)
+  expect(calls).toHaveLength(1)
+})
+
+test("non-transport prompt errors preserve failure accounting without automatic retry", async () => {
+  const logs: unknown[] = []
+  let calls = 0
+  const hooks = await plugin.server(
+    {
+      client: {
+        app: { log: async (input: unknown) => logs.push(input) },
+        session: {
+          promptAsync: async () => {
+            calls += 1
+            throw new Error("invalid provider configuration")
+          },
+        },
+      },
+    } as never,
+    { auto_continue: true, min_continue_interval_seconds: 0, max_prompt_failures: 3 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+  const context = { sessionID: "ses_non_transport" } as never
+
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, context)
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_non_transport" } } as never })
+  await new Promise((resolve) => setTimeout(resolve, 100))
+
+  expect(calls).toBe(1)
+  expect(logs).toHaveLength(1)
+  expect((await getGoal("ses_non_transport"))?.continuationFailures).toBe(1)
+})
+
+test("session.error without a pending attempt schedules recovery without a phantom failure", async () => {
+  const calls: unknown[] = []
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+          },
+        },
+      },
+    } as never,
+    { auto_continue: true, max_auto_turns: 5, min_continue_interval_seconds: 0, max_prompt_failures: 3 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  const context = { sessionID: "ses_1" } as never
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, context)
+  await hooks.event!({
+    event: {
+      type: "session.error",
+      properties: {
+        sessionID: "ses_1",
+        error: { name: "AI_APICallError", message: "Cannot connect to API: The socket connection was closed unexpectedly." },
+      },
+    } as never,
+  })
+
+  const afterError = await requireTool(tools.get_goal, "get_goal").execute({}, context)
+  expect(String(afterError)).toContain('"status": "active"')
+  expect(String(afterError)).toContain('"continuationFailures": 0')
+
+  // The first bounded automatic recovery starts without charging a failure.
+  await waitForLong(() => calls.length === 1)
+  const recovered = await requireTool(tools.get_goal, "get_goal").execute({}, context)
+  expect(String(recovered)).toContain('"status": "active"')
+  expect(String(recovered)).toContain('"continuationFailures": 0')
+  expect(String(recovered)).toContain('"autoTurns": 1')
+})
+
+test("restart resolves a persisted started pending attempt at the next idle", async () => {
+  const firstCalls: unknown[] = []
+  const hooks1 = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async (input: unknown) => {
+            firstCalls.push(input)
+          },
+        },
+      },
+    } as never,
+    { auto_continue: true, max_auto_turns: 5, min_continue_interval_seconds: 0, max_prompt_failures: 2 },
+  )
+  const tools1 = hooks1.tool
+  if (!tools1) throw new Error("expected goal tools to be registered")
+
+  const context = { sessionID: "ses_1" } as never
+  await requireTool(tools1.create_goal, "create_goal").execute({ objective: "keep going" }, context)
+  await hooks1.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+  await waitFor(() => firstCalls.length === 1)
+  await hooks1.event!({
+    event: { type: "session.status", properties: { sessionID: "ses_1", status: { type: "busy" } } } as never,
+  })
+  await hooks1.dispose?.()
+
+  // A fresh instance reads the same persisted state: the started=true pending
+  // attempt must be resolvable by the next idle after the restart.
+  const calls2: unknown[] = []
+  const hooks2 = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async (input: unknown) => {
+            calls2.push(input)
+          },
+        },
+      },
+    } as never,
+    { auto_continue: true, max_auto_turns: 5, min_continue_interval_seconds: 0, max_prompt_failures: 2 },
+  )
+  const tools2 = hooks2.tool
+  if (!tools2) throw new Error("expected goal tools to be registered")
+
+  await hooks2.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+  const read = await requireTool(tools2.get_goal, "get_goal").execute({}, context)
+  expect(String(read)).toContain('"continuationFailures": 1')
+
+  // The bounded retry then sends the next continuation attempt.
+  await waitForLong(() => calls2.length === 1)
+  const retried = await requireTool(tools2.get_goal, "get_goal").execute({}, context)
+  expect(String(retried)).toContain('"continuationFailures": 1')
+})
+
+test("persisted started=false pending attempts go stale after restart", async () => {
+  const hooks1 = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async () => {},
+        },
+      },
+    } as never,
+    { auto_continue: true, max_auto_turns: 5, min_continue_interval_seconds: 0, max_prompt_failures: 2 },
+  )
+  const tools1 = hooks1.tool
+  if (!tools1) throw new Error("expected goal tools to be registered")
+
+  const context = { sessionID: "ses_1" } as never
+  await requireTool(tools1.create_goal, "create_goal").execute({ objective: "keep going" }, context)
+  await reserveContinuation("ses_1", 10, 0)
+  await recordContinuationResult("ses_1", "success", 5)
+  expect((await getGoal("ses_1"))?.pendingContinuationStarted).toBe(false)
+
+  // Simulate an old persisted attempt by writing a stale millisecond timestamp
+  // directly into the state file instead of waiting 30 seconds.
+  const file = process.env.OPENCODE_GOAL_STATE_PATH!
+  const state = JSON.parse(await readFile(file, "utf8"))
+  state.goals.ses_1.pendingContinuationStart = Date.now() - 60_000
+  state.goals.ses_1.pendingContinuationStarted = false
+  await writeFile(file, JSON.stringify(state))
+  await hooks1.dispose?.()
+
+  const calls: unknown[] = []
+  const hooks2 = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+          },
+        },
+      },
+    } as never,
+    { auto_continue: true, max_auto_turns: 5, min_continue_interval_seconds: 0, max_prompt_failures: 2 },
+  )
+  const tools2 = hooks2.tool
+  if (!tools2) throw new Error("expected goal tools to be registered")
+
+  await hooks2.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+  const stale = await requireTool(tools2.get_goal, "get_goal").execute({}, context)
+  expect(String(stale)).toContain('"status": "active"')
+  expect(String(stale)).toContain('"continuationFailures": 1')
+
+  // The stale attempt triggers a bounded retry rather than wedging forever.
+  await waitForLong(() => calls.length === 1)
+})
+
+test("a locally delivered unstarted attempt never becomes a false no-response failure", async () => {
+  const calls: unknown[] = []
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+          },
+        },
+      },
+    } as never,
+    { auto_continue: true, min_continue_interval_seconds: 0, max_prompt_failures: 1 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+  const context = { sessionID: "ses_local_pending" } as never
+
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, context)
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_local_pending" } } as never })
+  expect(calls).toHaveLength(1)
+
+  const file = process.env.OPENCODE_GOAL_STATE_PATH!
+  const state = JSON.parse(await readFile(file, "utf8"))
+  state.goals.ses_local_pending.pendingContinuationStart = Date.now() - 60_000
+  await writeFile(file, JSON.stringify(state))
+  await hooks.event!({
+    event: { type: "session.status", properties: { sessionID: "ses_local_pending", status: { type: "idle" } } } as never,
+  })
+
+  const goal = await getGoal("ses_local_pending")
+  expect(goal?.status).toBe("active")
+  expect(goal?.continuationFailures).toBe(0)
+  expect(calls).toHaveLength(1)
+})
+
+test("a built-in retry status cancels scheduled transport recovery", async () => {
+  const calls: unknown[] = []
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+          },
+        },
+      },
+    } as never,
+    { auto_continue: true, min_continue_interval_seconds: 0 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+  await requireTool(tools.create_goal, "create_goal").execute(
+    { objective: "keep going" },
+    { sessionID: "ses_native_retry" } as never,
+  )
+
+  await hooks.event!({
+    event: {
+      type: "session.error",
+      properties: { sessionID: "ses_native_retry", error: { message: "network connection failed" } },
+    } as never,
+  })
+  await hooks.event!({
+    event: { type: "session.status", properties: { sessionID: "ses_native_retry", status: { type: "retry" } } } as never,
+  })
+  await new Promise((resolve) => setTimeout(resolve, 100))
+
+  expect(calls).toHaveLength(0)
+  expect((await getGoal("ses_native_retry"))?.continuationFailures).toBe(0)
+})
+
+test("assistant progress cancels no-pending transport recovery", async () => {
+  const calls: unknown[] = []
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+          },
+        },
+      },
+    } as never,
+    { auto_continue: true, min_continue_interval_seconds: 0 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+  const context = { sessionID: "ses_progress_recovery" } as never
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, context)
+
+  await hooks.event!({
+    event: {
+      type: "session.error",
+      properties: { sessionID: "ses_progress_recovery", error: { message: "network connection failed" } },
+    } as never,
+  })
+  await hooks.event!({
+    event: {
+      type: "message.updated",
+      properties: {
+        sessionID: "ses_progress_recovery",
+        message: {
+          info: { id: "msg_recovered", role: "assistant", sessionID: "ses_progress_recovery" },
+          parts: [{ type: "text", text: "The provider recovered without plugin intervention." }],
+        },
+      },
+    } as never,
+  })
+  await new Promise((resolve) => setTimeout(resolve, 100))
+
+  expect(calls).toHaveLength(0)
+})
+
+test("successful tool progress cancels no-pending transport recovery", async () => {
+  const calls: unknown[] = []
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+          },
+        },
+      },
+    } as never,
+    { auto_continue: true, min_continue_interval_seconds: 0 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+  const context = { sessionID: "ses_tool_recovery" } as never
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, context)
+
+  await hooks.event!({
+    event: {
+      type: "session.error",
+      properties: { sessionID: "ses_tool_recovery", error: { message: "network connection failed" } },
+    } as never,
+  })
+  await hooks["tool.execute.after"]!(
+    { tool: "bash", sessionID: "ses_tool_recovery", callID: "call_progress", args: {} } as never,
+    { title: "bash", output: "tests passed", metadata: {} } as never,
+  )
+  await new Promise((resolve) => setTimeout(resolve, 100))
+
+  expect(calls).toHaveLength(0)
+})
+
+test("interrupted connection messages are not classified as transport recovery", async () => {
+  const calls: unknown[] = []
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+          },
+        },
+      },
+    } as never,
+    { auto_continue: true, min_continue_interval_seconds: 0 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+  await requireTool(tools.create_goal, "create_goal").execute(
+    { objective: "keep going" },
+    { sessionID: "ses_interrupted" } as never,
+  )
+
+  await hooks.event!({
+    event: {
+      type: "session.error",
+      properties: { sessionID: "ses_interrupted", error: { message: "socket connection interrupted by user" } },
+    } as never,
+  })
+  await new Promise((resolve) => setTimeout(resolve, 100))
+
+  expect(calls).toHaveLength(0)
+  expect((await getGoal("ses_interrupted"))?.continuationFailures).toBe(0)
+})
+
+test("tool progress honors completed states and never resets on failed or incomplete tools", async () => {
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async () => {},
+        },
+      },
+    } as never,
+    { auto_continue: false },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  const context = { sessionID: "ses_1" } as never
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, context)
+  await recordContinuationResult("ses_1", "failure", 5)
+  expect((await getGoal("ses_1"))?.continuationFailures).toBe(1)
+
+  const fireTool = (output: unknown) =>
+    hooks["tool.execute.after"]!(
+      { tool: "bash", sessionID: "ses_1", callID: `call_${Math.random()}`, args: {} } as never,
+      output as never,
+    )
+
+  await hooks["tool.execute.after"]!(
+    { tool: "get_goal", sessionID: "ses_1", callID: "call_get_goal", args: {} } as never,
+    { title: "get_goal", output: '{"goal":{"status":"active"}}', metadata: {} } as never,
+  )
+  expect((await getGoal("ses_1"))?.continuationFailures).toBe(1)
+
+  // Incomplete, failed, cancelled, and aborted states must not reset even
+  // without an error string.
+  await fireTool({ title: "bash", output: "task_id: t1\nstate: running", metadata: {} })
+  await fireTool({ title: "bash", output: "task_id: t1\nstate: failed", metadata: {} })
+  await fireTool({ title: "bash", output: "task_id: t1\nstate: cancelled", metadata: {} })
+  await fireTool({ title: "task", output: '<task id="t1" state="error">failed</task>', metadata: {} })
+  await fireTool({ title: "bash", output: "nope", state: "aborted", metadata: {} })
+  await fireTool({ title: "bash", output: "nope", status: "running", metadata: {} })
+  await fireTool({ title: "bash", output: "nope", success: false, metadata: {} })
+  const unchanged = await requireTool(tools.get_goal, "get_goal").execute({}, context)
+  expect(String(unchanged)).toContain('"continuationFailures": 1')
+
+  // Completed and plain successful outputs reset the failure counter.
+  await fireTool({ title: "bash", output: "task_id: t1\nstate: completed\n\n<task_result>done</task_result>", metadata: {} })
+  const completed = await requireTool(tools.get_goal, "get_goal").execute({}, context)
+  expect(String(completed)).toContain('"continuationFailures": 0')
+
+  await fireTool({ title: "bash", output: "tests passed", metadata: {} })
+  const plainSuccess = await requireTool(tools.get_goal, "get_goal").execute({}, context)
+  expect(String(plainSuccess)).toContain('"continuationFailures": 0')
+})
+
+test("watchdog rescues at most once per busy episode", async () => {
+  const calls: unknown[] = []
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+          },
+        },
+      },
+    } as never,
+    { auto_continue: false, max_turn_time: 0.02, max_prompt_failures: 5 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  const context = { sessionID: "ses_1" } as never
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, context)
+  await hooks.event!({
+    event: { type: "session.status", properties: { sessionID: "ses_1", status: { type: "busy" } } } as never,
+  })
+  await waitForContinuation(calls)
+  expect(calls).toHaveLength(1)
+
+  // Another busy event inside the same episode must not re-arm the watchdog.
+  await hooks.event!({
+    event: { type: "session.status", properties: { sessionID: "ses_1", status: { type: "busy" } } } as never,
+  })
+  await new Promise((resolve) => setTimeout(resolve, 80))
+  expect(calls).toHaveLength(1)
+
+  // Ending the episode and starting a new one rescues again.
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+  await hooks.event!({
+    event: { type: "session.status", properties: { sessionID: "ses_1", status: { type: "busy" } } } as never,
+  })
+  await waitFor(() => calls.length === 2)
+  expect(calls).toHaveLength(2)
 })

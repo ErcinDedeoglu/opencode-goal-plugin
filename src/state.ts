@@ -65,6 +65,8 @@ export type Goal = {
   autoTurns: number
   lastContinuationAt: number | null
   continuationFailures: number
+  pendingContinuationStart: number | null
+  pendingContinuationStarted: boolean
   lastStatus: string | null
   maxAutoTurns: number | null
   maxDurationSeconds: number | null
@@ -148,6 +150,8 @@ const GoalSchema = Schema.Struct({
   autoTurns: Schema.Number,
   lastContinuationAt: NullableNumber,
   continuationFailures: Schema.optionalWith(Schema.Number, { default: () => 0 }),
+  pendingContinuationStart: Schema.optionalWith(NullableNumber, { default: () => null }),
+  pendingContinuationStarted: Schema.optionalWith(Schema.Boolean, { default: () => false }),
   lastStatus: Schema.optionalWith(NullableString, { default: () => null }),
   maxAutoTurns: Schema.optionalWith(NullableNumber, { default: () => null }),
   maxDurationSeconds: Schema.optionalWith(NullableNumber, { default: () => null }),
@@ -313,6 +317,15 @@ function normalizeGoal(goal: Goal) {
   goal.lastAssistantMessageID ??= ""
   goal.lastPromptAgent ??= null
   goal.awaitingContinuationProgress = goal.awaitingContinuationProgress === true
+  goal.lastContinuationAt =
+    typeof goal.lastContinuationAt === "number" && Number.isFinite(goal.lastContinuationAt)
+      ? Math.floor(goal.lastContinuationAt >= 1_000_000_000_000 ? goal.lastContinuationAt / 1000 : goal.lastContinuationAt)
+      : null
+  goal.pendingContinuationStart =
+    typeof goal.pendingContinuationStart === "number" && Number.isFinite(goal.pendingContinuationStart)
+      ? goal.pendingContinuationStart
+      : null
+  goal.pendingContinuationStarted = goal.pendingContinuationStarted === true
   goal.continuationBaselineMessageID ??= ""
   goal.continuationBaselineSummary ??= ""
   goal.noProgressTurns = nonNegativeInteger(goal.noProgressTurns, 0)
@@ -388,6 +401,8 @@ export function snapshot(goal: Goal): GoalSnapshot {
     blocker: goal.blocker ?? null,
     closedAt: goal.closedAt ?? null,
     continuationFailures: goal.continuationFailures,
+    pendingContinuationStart: goal.pendingContinuationStart,
+    pendingContinuationStarted: goal.pendingContinuationStarted,
     lastStatus: goal.lastStatus,
     maxAutoTurns: goal.maxAutoTurns,
     maxDurationSeconds: goal.maxDurationSeconds,
@@ -450,6 +465,8 @@ export async function createGoal(sessionID: string, objective: string, options?:
       autoTurns: 0,
       lastContinuationAt: null,
       continuationFailures: 0,
+      pendingContinuationStart: null,
+      pendingContinuationStarted: false,
       lastStatus: paused ? "Goal recorded from Plan mode; execution paused until resumed from Build mode." : "Goal set.",
       maxAutoTurns: normalizedOptions.maxAutoTurns,
       maxDurationSeconds: normalizedOptions.maxDurationSeconds,
@@ -497,6 +514,12 @@ export async function updateGoalObjective(
     goal.closedAt = null
     goal.stopReason = planModePause ? PLAN_MODE_STOP_REASON : null
     goal.budgetWrapupSent = false
+    if (goal.status === "active") {
+      goal.continuationFailures = 0
+      goal.pendingContinuationStart = null
+      goal.pendingContinuationStarted = false
+      goal.awaitingContinuationProgress = false
+    }
     if (agent) goal.lastPromptAgent = agent
     goal.lastStatus = planModePause
       ? "Goal objective updated; execution paused while the session is in Plan mode."
@@ -548,6 +571,8 @@ export async function setGoalStatus(sessionID: string, status: MutableGoalStatus
     goal.updatedAt = nowSeconds()
     goal.lastAccountedAt = status === "active" ? goal.updatedAt : null
     goal.continuationFailures = status === "active" ? 0 : goal.continuationFailures
+    goal.pendingContinuationStart = status === "active" ? null : goal.pendingContinuationStart
+    goal.pendingContinuationStarted = status === "active" ? false : goal.pendingContinuationStarted
     goal.noProgressTurns = status === "active" ? 0 : goal.noProgressTurns
     goal.stopReason = status === "active" ? null : "paused"
     goal.budgetWrapupSent = status === "active" ? false : goal.budgetWrapupSent
@@ -637,6 +662,7 @@ export async function recordAssistantProgress(sessionID: string, input: Assistan
     const threshold = positiveIntegerOrNull(input.noProgressTokenThreshold) ?? goal.noProgressTokenThreshold
     const maxNoProgressTurns = positiveIntegerOrNull(input.maxNoProgressTurns) ?? goal.maxNoProgressTurns
     const summary = summarizeText(text)
+    const substantive = /[\p{L}\p{N}]/u.test(text)
     const previousSummary = summarizeText(goal.lastAssistantText)
     const repeatedMessage = Boolean(messageID && messageID === goal.lastAssistantMessageID)
     const changed = Boolean(summary && summary !== previousSummary)
@@ -644,6 +670,15 @@ export async function recordAssistantProgress(sessionID: string, input: Assistan
     if (summary && (!repeatedMessage || changed)) recordCheckpoint(goal, summary)
     if (text) goal.lastAssistantText = text
     if (messageID) goal.lastAssistantMessageID = messageID
+
+    // Substantive assistant text proves the continuation transport is healthy,
+    // so a pending continuation is resolved and any accumulated prompt failures
+    // are cleared. Delivery of a prompt alone never resets the counter.
+    if (substantive && summary && (!repeatedMessage || changed)) {
+      goal.continuationFailures = 0
+      goal.pendingContinuationStart = null
+      goal.pendingContinuationStarted = false
+    }
 
     // No-progress accounting is scoped to goal continuation turns: it only runs
     // once per reserved continuation, when the completed turn is observed at the
@@ -656,6 +691,8 @@ export async function recordAssistantProgress(sessionID: string, input: Assistan
       messageID !== goal.continuationBaselineMessageID
     if (continuationTurnCompleted) {
       goal.awaitingContinuationProgress = false
+      goal.pendingContinuationStart = null
+      goal.pendingContinuationStarted = false
       const lowOutput = outputTokens > 0 && outputTokens < (threshold ?? DEFAULT_NO_PROGRESS_TOKEN_THRESHOLD)
       const changedSinceContinuation = Boolean(summary && summary !== goal.continuationBaselineSummary)
       if (lowOutput && !changedSinceContinuation) {
@@ -706,22 +743,37 @@ export async function reserveContinuation(sessionID: string, maxAutoTurns: numbe
   })
 }
 
-export async function recordContinuationResult(sessionID: string, result: "success" | "failure", maxFailures: number) {
+export async function recordContinuationResult(
+  sessionID: string,
+  result: "success" | "failure",
+  maxFailures: number,
+  options?: { armNoProgress?: boolean; started?: boolean; requirePending?: boolean },
+) {
   return mutate((state) => {
     const goal = state.goals[sessionID]
     if (!goal || isClosed(goal.status)) return goal ? snapshot(goal) : null
     const now = nowSeconds()
     goal.updatedAt = now
     if (result === "success") {
-      goal.continuationFailures = 0
+      // Successful prompt delivery arms the pending-continuation window but
+      // never resets the failure counter; only real progress, a successful
+      // tool output, or an explicit resume/new goal clears it. Delivery alone
+      // is not "started": a session.status busy event marks the attempt as
+      // actually started through markPendingContinuationStarted. Watchdog
+      // rescues deliver while already busy and pass started: true.
       if (goal.status === "active") {
+        goal.pendingContinuationStart = Date.now()
+        goal.pendingContinuationStarted = options?.started === true
         goal.lastStatus = "Auto-continue prompt sent."
-        goal.awaitingContinuationProgress = true
+        if (options?.armNoProgress !== false) goal.awaitingContinuationProgress = true
       }
       return snapshot(goal)
     }
+    if (options?.requirePending && goal.pendingContinuationStart == null) return null
     goal.continuationFailures += 1
     goal.awaitingContinuationProgress = false
+    goal.pendingContinuationStart = null
+    goal.pendingContinuationStarted = false
     goal.lastStatus = `Auto-continue failed ${goal.continuationFailures} time(s).`
     pushHistory(goal, "error", goal.lastStatus)
     if (goal.continuationFailures >= maxFailures) {
@@ -733,6 +785,37 @@ export async function recordContinuationResult(sessionID: string, result: "succe
       goal.blocker = "Auto-continue prompt failed repeatedly. Resume the goal to retry."
       pushHistory(goal, "paused", goal.lastStatus)
     }
+    return snapshot(goal)
+  })
+}
+
+export async function markPendingContinuationStarted(sessionID: string) {
+  return mutate((state) => {
+    const goal = state.goals[sessionID]
+    if (!goal || goal.status !== "active") return goal ? snapshot(goal) : null
+    if (goal.pendingContinuationStart == null || goal.pendingContinuationStarted) return snapshot(goal)
+    goal.pendingContinuationStarted = true
+    goal.updatedAt = nowSeconds()
+    return snapshot(goal)
+  })
+}
+
+export async function recordToolProgress(sessionID: string, text?: string) {
+  return mutate((state) => {
+    const goal = state.goals[sessionID]
+    if (!goal || goal.status !== "active") return goal ? snapshot(goal) : null
+    const value = text?.trim() ?? ""
+    if (!value) return snapshot(goal)
+    if (goal.continuationFailures === 0 && goal.pendingContinuationStart == null) return snapshot(goal)
+    // A successful tool output is real progress: it resolves any pending
+    // continuation and clears the prompt-failure counter. Failed tool outputs
+    // never reach this reset.
+    goal.continuationFailures = 0
+    goal.pendingContinuationStart = null
+    goal.pendingContinuationStarted = false
+    goal.awaitingContinuationProgress = false
+    goal.noProgressTurns = 0
+    goal.updatedAt = nowSeconds()
     return snapshot(goal)
   })
 }

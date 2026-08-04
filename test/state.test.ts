@@ -7,12 +7,14 @@ import {
   clearGoal,
   completeGoal,
   createGoal,
+  markPendingContinuationStarted,
   recordAssistantProgress,
   getGoal,
   markGoalUnmet,
   pauseGoalForPlanMode,
   recordContinuationResult,
   recordPromptAgent,
+  recordToolProgress,
   reserveContinuation,
   setGoalStatus,
   updateGoalObjective,
@@ -278,4 +280,161 @@ test("does not overwrite corrupt persisted state", async () => {
   await expect(createGoal("ses_1", "ship the plugin", null)).rejects.toThrow()
 
   expect(await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8")).toBe("{not valid json")
+})
+
+test("prompt delivery arms the pending window but never resets the failure count", async () => {
+  await createGoal("ses_1", "keep going", null)
+  await reserveContinuation("ses_1", 10, 0)
+  await recordContinuationResult("ses_1", "failure", 5)
+  await recordContinuationResult("ses_1", "failure", 5)
+
+  const delivered = await recordContinuationResult("ses_1", "success", 5)
+  expect(delivered?.continuationFailures).toBe(2)
+  expect(delivered?.pendingContinuationStart).not.toBeNull()
+  expect(delivered?.pendingContinuationStarted).toBe(false)
+  expect(delivered?.awaitingContinuationProgress).toBe(true)
+
+  const failed = await recordContinuationResult("ses_1", "failure", 5)
+  expect(failed?.continuationFailures).toBe(3)
+  expect(failed?.pendingContinuationStart).toBeNull()
+  expect(failed?.pendingContinuationStarted).toBe(false)
+  expect(failed?.awaitingContinuationProgress).toBe(false)
+})
+
+test("a session busy event marks the pending attempt as started", async () => {
+  await createGoal("ses_1", "keep going", null)
+  await reserveContinuation("ses_1", 10, 0)
+  await recordContinuationResult("ses_1", "success", 5)
+  expect((await getGoal("ses_1"))?.pendingContinuationStarted).toBe(false)
+
+  const started = await markPendingContinuationStarted("ses_1")
+  expect(started?.pendingContinuationStarted).toBe(true)
+
+  // Marking an already-started or absent attempt is idempotent.
+  const again = await markPendingContinuationStarted("ses_1")
+  expect(again?.pendingContinuationStarted).toBe(true)
+  await recordContinuationResult("ses_1", "failure", 5)
+  expect((await markPendingContinuationStarted("ses_1"))?.pendingContinuationStart).toBeNull()
+})
+
+test("persists continuation failures and the pending window across restart", async () => {
+  await createGoal("ses_1", "keep going", null)
+  await reserveContinuation("ses_1", 10, 0)
+  await recordContinuationResult("ses_1", "success", 5)
+  await recordContinuationResult("ses_1", "failure", 5)
+  await recordContinuationResult("ses_1", "failure", 5)
+
+  // getGoal re-reads the persisted state file, simulating a process restart.
+  const reloaded = await getGoal("ses_1")
+  expect(reloaded?.continuationFailures).toBe(2)
+  expect(reloaded?.pendingContinuationStart).toBeNull()
+  expect(reloaded?.pendingContinuationStarted).toBe(false)
+
+  await recordContinuationResult("ses_1", "success", 5)
+  const reloadedPending = await getGoal("ses_1")
+  expect(reloadedPending?.continuationFailures).toBe(2)
+  expect(reloadedPending?.pendingContinuationStart).toBeGreaterThanOrEqual(Date.now() - 5_000)
+  expect(reloadedPending?.pendingContinuationStarted).toBe(false)
+
+  await markPendingContinuationStarted("ses_1")
+  const reloadedStarted = await getGoal("ses_1")
+  expect(reloadedStarted?.pendingContinuationStarted).toBe(true)
+  expect(reloadedStarted?.pendingContinuationStart).not.toBeNull()
+})
+
+test("decodes persisted state that lacks the retry fields", async () => {
+  await writeFile(
+    process.env.OPENCODE_GOAL_STATE_PATH!,
+    JSON.stringify({
+      version: 1,
+      goals: {
+        ses_1: {
+          sessionID: "ses_1",
+          objective: "continue",
+          status: "active",
+          tokenBudget: null,
+          tokensUsed: 0,
+          timeUsedSeconds: 0,
+          createdAt: 1,
+          updatedAt: 1,
+          lastAccountedAt: 1,
+          autoTurns: 0,
+          lastContinuationAt: null,
+        },
+      },
+    }),
+  )
+
+  const goal = await getGoal("ses_1")
+
+  expect(goal?.continuationFailures).toBe(0)
+  expect(goal?.pendingContinuationStart).toBeNull()
+  expect(goal?.pendingContinuationStarted).toBe(false)
+})
+
+test("substantive assistant text resets the failure count and pending window", async () => {
+  await createGoal("ses_1", "keep going", null)
+  await reserveContinuation("ses_1", 10, 0)
+  await recordContinuationResult("ses_1", "failure", 5)
+  await recordContinuationResult("ses_1", "failure", 5)
+  await recordContinuationResult("ses_1", "success", 5)
+  expect((await getGoal("ses_1"))?.pendingContinuationStart).not.toBeNull()
+
+  const progressed = await recordAssistantProgress("ses_1", {
+    messageID: "m1",
+    text: "Implemented the parser and added passing tests",
+    outputTokens: 400,
+  })
+
+  expect(progressed?.continuationFailures).toBe(0)
+  expect(progressed?.pendingContinuationStart).toBeNull()
+  expect(progressed?.status).toBe("active")
+})
+
+test("successful tool output resets failures and clears the pending window", async () => {
+  await createGoal("ses_1", "keep going", null)
+  await recordContinuationResult("ses_1", "failure", 5)
+  await recordContinuationResult("ses_1", "success", 5)
+  expect((await getGoal("ses_1"))?.continuationFailures).toBe(1)
+
+  const progressed = await recordToolProgress("ses_1", "tests passed")
+
+  expect(progressed?.continuationFailures).toBe(0)
+  expect(progressed?.pendingContinuationStart).toBeNull()
+  expect(progressed?.awaitingContinuationProgress).toBe(false)
+})
+
+test("re-reading the previous assistant message does not resolve a pending continuation", async () => {
+  await createGoal("ses_1", "keep going", null)
+  await recordAssistantProgress("ses_1", { messageID: "m1", text: "Initial progress" })
+  await reserveContinuation("ses_1", 10, 0)
+  await recordContinuationResult("ses_1", "success", 5)
+
+  const repeated = await recordAssistantProgress("ses_1", {
+    messageID: "m1",
+    text: "Initial progress",
+    evaluateContinuation: true,
+  })
+
+  expect(repeated?.pendingContinuationStart).not.toBeNull()
+  expect(repeated?.awaitingContinuationProgress).toBe(true)
+})
+
+test("lastContinuationAt remains a public seconds timestamp", async () => {
+  await createGoal("ses_1", "keep going", null)
+  const reserved = await reserveContinuation("ses_1", 10, 0)
+
+  expect(reserved?.lastContinuationAt).toBe(Math.floor(Date.now() / 1000))
+  expect(reserved?.lastContinuationAt).toBeLessThan(1_000_000_000_000)
+})
+
+test("resuming a paused goal clears the failure count and pending window", async () => {
+  await createGoal("ses_1", "keep going", null)
+  await recordContinuationResult("ses_1", "failure", 1)
+  expect((await getGoal("ses_1"))?.status).toBe("paused")
+
+  const resumed = await setGoalStatus("ses_1", "active")
+
+  expect(resumed?.continuationFailures).toBe(0)
+  expect(resumed?.pendingContinuationStart).toBeNull()
 })
