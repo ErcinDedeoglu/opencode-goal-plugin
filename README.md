@@ -52,6 +52,28 @@ opencode plugin -g @prevalentware/opencode-goal-plugin
 
 OpenCode detects both package entrypoints and writes the plugin into the server and TUI config targets.
 
+### OpenCode 2 Beta
+
+The package also supports OpenCode 2 preview `0.0.0-next-17055`. Add it to the V2 server and TUI plugin lists:
+
+`opencode.json`:
+
+```json
+{
+  "plugins": ["@prevalentware/opencode-goal-plugin"]
+}
+```
+
+`~/.config/opencode/cli.json`:
+
+```json
+{
+  "plugins": ["@prevalentware/opencode-goal-plugin"]
+}
+```
+
+OpenCode 2 plugin APIs are still beta. This package pins its V2 development contract to the preview version above; later previews may require a compatible plugin update. V2 currently supports the goal command, tools, persistent state, usage accounting, idle continuation, Plan-mode safety, and TUI sidebar/palette integration. Goal-specific compaction context and recovery of already-running child sessions after a plugin restart remain V1-only because the current V2 plugin context does not expose equivalent hooks or history queries.
+
 ## Manual Config
 
 If you configure it manually, add the package to both config files.
