@@ -322,7 +322,8 @@ test("V2 events account usage and checkpoints from step/usage events", async () 
 
   await waitFor(async () => {
     const read = await goalTool(mock, "get_goal").execute({}, toolContext())
-    return contentOf(read).includes('"tokensUsed": 70')
+    const content = contentOf(read)
+    return content.includes('"tokensUsed": 70') && content.includes("IMPLEMENTED_THE_FEATURE")
   })
   const readAfterStep = await goalTool(mock, "get_goal").execute({}, toolContext())
   expect(contentOf(readAfterStep)).toContain('"tokensUsed": 70')
