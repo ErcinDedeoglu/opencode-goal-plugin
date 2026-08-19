@@ -5,6 +5,7 @@ import { tmpdir } from "node:os"
 import plugin from "../src/server"
 import {
   getGoal,
+  getGoalInternal,
   recordContinuationResult,
   reserveContinuation,
 } from "../src/state"
@@ -668,7 +669,7 @@ test("turn watchdog retries a busy active goal without consuming continuation bu
   expect(String(read)).toContain('"awaitingContinuationProgress": false')
   // A watchdog-delivered prompt is already inside a busy episode, so the
   // pending attempt is marked started immediately.
-  expect(String(read)).toContain('"pendingContinuationStarted": true')
+  expect((await getGoalInternal("ses_1"))?.pendingAttempt?.started).toBe(true)
 
   // The busy episode ends. Auto-continue is disabled here, so nothing further
   // happens on idle; the watchdog-delivered attempt stays pending and started.
@@ -677,7 +678,7 @@ test("turn watchdog retries a busy active goal without consuming continuation bu
   expect(String(afterIdle)).toContain('"status": "active"')
   expect(String(afterIdle)).toContain('"autoTurns": 0')
   expect(String(afterIdle)).toContain('"continuationFailures": 1')
-  expect(String(afterIdle)).toContain('"pendingContinuationStart": null')
+  expect((await getGoalInternal("ses_1"))?.pendingAttempt).toBeNull()
 
   // A new busy episode rescues again, still without auto-turn budgets.
   await hooks.event!({
@@ -732,23 +733,29 @@ test("turn watchdog cancels on idle, retry, deletion, and dispose", async () => 
         },
       },
     } as never,
-    { auto_continue: false, max_turn_time: 0.02 },
+    { auto_continue: false, max_turn_time: 0.08 },
   )
   const tools = hooks.tool
   if (!tools) throw new Error("expected goal tools to be registered")
 
   for (const sessionID of ["ses_idle", "ses_retry", "ses_deleted"]) {
     await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, { sessionID } as never)
-    await hooks.event!({
-      event: { type: "session.status", properties: { sessionID, status: { type: "busy" } } } as never,
-    })
   }
+  await hooks.event!({
+    event: { type: "session.status", properties: { sessionID: "ses_idle", status: { type: "busy" } } } as never,
+  })
   await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_idle" } } as never })
+  await hooks.event!({
+    event: { type: "session.status", properties: { sessionID: "ses_retry", status: { type: "busy" } } } as never,
+  })
   await hooks.event!({
     event: { type: "session.status", properties: { sessionID: "ses_retry", status: { type: "retry" } } } as never,
   })
+  await hooks.event!({
+    event: { type: "session.status", properties: { sessionID: "ses_deleted", status: { type: "busy" } } } as never,
+  })
   await hooks.event!({ event: { type: "session.deleted", properties: { info: { id: "ses_deleted" } } } as never })
-  await new Promise((resolve) => setTimeout(resolve, 50))
+  await new Promise((resolve) => setTimeout(resolve, 100))
 
   expect(calls).toHaveLength(0)
 
@@ -760,7 +767,7 @@ test("turn watchdog cancels on idle, retry, deletion, and dispose", async () => 
     event: { type: "session.status", properties: { sessionID: "ses_disposed", status: { type: "busy" } } } as never,
   })
   await hooks.dispose?.()
-  await new Promise((resolve) => setTimeout(resolve, 50))
+  await new Promise((resolve) => setTimeout(resolve, 100))
 
   expect(calls).toHaveLength(0)
 })
@@ -1865,7 +1872,7 @@ test("failed tool output does not reset prompt failures; successful tool output 
   )
   const afterSuccessfulTool = await requireTool(tools.get_goal, "get_goal").execute({}, context)
   expect(String(afterSuccessfulTool)).toContain('"continuationFailures": 0')
-  expect(String(afterSuccessfulTool)).toContain('"pendingContinuationStart": null')
+  expect((await getGoalInternal("ses_1"))?.pendingAttempt).toBeNull()
 })
 
 test("duplicate idle events before any busy never count a failure or send a duplicate", async () => {
@@ -1899,8 +1906,10 @@ test("duplicate idle events before any busy never count a failure or send a dupl
   const read = await requireTool(tools.get_goal, "get_goal").execute({}, context)
   expect(String(read)).toContain('"status": "active"')
   expect(String(read)).toContain('"continuationFailures": 0')
-  expect(String(read)).toContain('"pendingContinuationStarted": false')
-  expect(String(read)).not.toContain('"pendingContinuationStart": null')
+  // The attempt was delivered but never started by a busy; it must remain
+  // pending until it either starts or goes stale.
+  expect((await getGoalInternal("ses_1"))?.pendingAttempt?.started).toBe(false)
+  expect((await getGoalInternal("ses_1"))?.pendingAttempt).not.toBeNull()
 })
 
 test("paired idle events after a busy count exactly one unresolved failure and pause at the ceiling", async () => {
@@ -1929,8 +1938,7 @@ test("paired idle events after a busy count exactly one unresolved failure and p
   await hooks.event!({
     event: { type: "session.status", properties: { sessionID: "ses_1", status: { type: "busy" } } } as never,
   })
-  const started = await requireTool(tools.get_goal, "get_goal").execute({}, context)
-  expect(String(started)).toContain('"pendingContinuationStarted": true')
+  expect((await getGoalInternal("ses_1"))?.pendingAttempt?.started).toBe(true)
 
   // The following logical idle has no substantive progress: exactly one
   // unresolved failure is counted, which hits the ceiling and pauses.
@@ -1967,7 +1975,7 @@ test("concurrent session.error transport events count at most one failure per pe
   await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, context)
   await reserveContinuation("ses_1", 10, 0)
   await recordContinuationResult("ses_1", "success", 3)
-  expect((await getGoal("ses_1"))?.pendingContinuationStart).not.toBeNull()
+  expect((await getGoalInternal("ses_1"))?.pendingAttempt).not.toBeNull()
 
   const transportEvent = {
     event: {
@@ -2079,7 +2087,7 @@ test("a repeated old assistant message cannot hide a no-response failure", async
   expect(calls).toHaveLength(1)
 })
 
-test("non-transport prompt errors preserve failure accounting without automatic retry", async () => {
+test("non-transport prompt errors do not count toward the ceiling or auto-retry", async () => {
   const logs: unknown[] = []
   let calls = 0
   const hooks = await plugin.server(
@@ -2104,9 +2112,13 @@ test("non-transport prompt errors preserve failure accounting without automatic 
   await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_non_transport" } } as never })
   await new Promise((resolve) => setTimeout(resolve, 100))
 
+  // Non-transport failures are neither transport nor no-response: they must
+  // not increment the max_prompt_failures ceiling nor schedule an auto-retry,
+  // while preserving useful error logging.
   expect(calls).toBe(1)
   expect(logs).toHaveLength(1)
-  expect((await getGoal("ses_non_transport"))?.continuationFailures).toBe(1)
+  expect((await getGoal("ses_non_transport"))?.continuationFailures).toBe(0)
+  expect((await getGoal("ses_non_transport"))?.status).toBe("active")
 })
 
 test("session.error without a pending attempt schedules recovery without a phantom failure", async () => {
@@ -2222,14 +2234,21 @@ test("persisted started=false pending attempts go stale after restart", async ()
   await requireTool(tools1.create_goal, "create_goal").execute({ objective: "keep going" }, context)
   await reserveContinuation("ses_1", 10, 0)
   await recordContinuationResult("ses_1", "success", 5)
-  expect((await getGoal("ses_1"))?.pendingContinuationStarted).toBe(false)
+  expect((await getGoalInternal("ses_1"))?.pendingAttempt?.started).toBe(false)
 
-  // Simulate an old persisted attempt by writing a stale millisecond timestamp
-  // directly into the state file instead of waiting 30 seconds.
+  // Simulate an old persisted attempt by writing a stale millisecond reservedAt
+  // timestamp directly into the state file instead of waiting 30 seconds.
   const file = process.env.OPENCODE_GOAL_STATE_PATH!
   const state = JSON.parse(await readFile(file, "utf8"))
-  state.goals.ses_1.pendingContinuationStart = Date.now() - 60_000
-  state.goals.ses_1.pendingContinuationStarted = false
+  state.goals.ses_1.pendingAttempt = {
+    id: "att_stale",
+    reservedAt: Date.now() - 60_000,
+    started: false,
+    delivered: true,
+    committed: true,
+    armNoProgress: true,
+    previousLastContinuationAt: null,
+  }
   await writeFile(file, JSON.stringify(state))
   await hooks1.dispose?.()
 
@@ -2282,7 +2301,15 @@ test("a locally delivered unstarted attempt never becomes a false no-response fa
 
   const file = process.env.OPENCODE_GOAL_STATE_PATH!
   const state = JSON.parse(await readFile(file, "utf8"))
-  state.goals.ses_local_pending.pendingContinuationStart = Date.now() - 60_000
+  state.goals.ses_local_pending.pendingAttempt = {
+    id: "att_local",
+    reservedAt: Date.now() - 60_000,
+    started: false,
+    delivered: true,
+    committed: true,
+    armNoProgress: true,
+    previousLastContinuationAt: null,
+  }
   await writeFile(file, JSON.stringify(state))
   await hooks.event!({
     event: { type: "session.status", properties: { sessionID: "ses_local_pending", status: { type: "idle" } } } as never,
@@ -2328,6 +2355,109 @@ test("a built-in retry status cancels scheduled transport recovery", async () =>
 
   expect(calls).toHaveLength(0)
   expect((await getGoal("ses_native_retry"))?.continuationFailures).toBe(0)
+})
+
+test("a native retry status suppresses a later session.error until busy or idle ends the episode", async () => {
+  const calls: unknown[] = []
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+          },
+        },
+      },
+    } as never,
+    { auto_continue: true, min_continue_interval_seconds: 0, max_prompt_failures: 3 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+  const sessionID = "ses_retry_first"
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, { sessionID } as never)
+
+  // The native retry status arrives BEFORE the transport error. The error must
+  // not schedule plugin recovery while the provider is already retrying.
+  await hooks.event!({
+    event: { type: "session.status", properties: { sessionID, status: { type: "retry" } } } as never,
+  })
+  await hooks.event!({
+    event: {
+      type: "session.error",
+      properties: { sessionID, error: { message: "network connection failed" } },
+    } as never,
+  })
+  await new Promise((resolve) => setTimeout(resolve, 100))
+
+  expect(calls).toHaveLength(0)
+  expect((await getGoal(sessionID))?.continuationFailures).toBe(0)
+  expect((await getGoal(sessionID))?.status).toBe("active")
+
+  // busy ends the retry episode and clears the marker; a subsequent transport
+  // error outside the episode may then start plugin recovery.
+  await hooks.event!({
+    event: { type: "session.status", properties: { sessionID, status: { type: "busy" } } } as never,
+  })
+  await hooks.event!({
+    event: {
+      type: "session.error",
+      properties: { sessionID, error: { message: "network connection failed" } },
+    } as never,
+  })
+  await waitForLong(() => calls.length === 1)
+  expect(JSON.stringify(calls[0])).toContain("Continue working toward the active session goal")
+})
+
+test("an error during a native retry episode does not fail the pending attempt", async () => {
+  const calls: unknown[] = []
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+          },
+        },
+      },
+    } as never,
+    { auto_continue: false, min_continue_interval_seconds: 0, max_prompt_failures: 3 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+  const sessionID = "ses_retry_pending"
+  const context = { sessionID } as never
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, context)
+  await reserveContinuation(sessionID, 10, 0)
+  await recordContinuationResult(sessionID, "success", 5)
+  const attemptId = (await getGoalInternal(sessionID))?.pendingAttempt?.id
+  expect(attemptId).toMatch(/^att_/)
+
+  // retry -> error while a prompt is pending: the suppressed error must not
+  // count a failure or clear the pending attempt.
+  await hooks.event!({
+    event: { type: "session.status", properties: { sessionID, status: { type: "retry" } } } as never,
+  })
+  await hooks.event!({
+    event: {
+      type: "session.error",
+      properties: { sessionID, error: { message: "network connection failed" } },
+    } as never,
+  })
+  await new Promise((resolve) => setTimeout(resolve, 100))
+
+  expect(calls).toHaveLength(0)
+  expect((await getGoal(sessionID))?.continuationFailures).toBe(0)
+  expect((await getGoalInternal(sessionID))?.pendingAttempt?.id).toBe(attemptId)
+
+  // busy ends the retry episode and marks the attempt started; the following
+  // idle then counts exactly one unresolved failure.
+  await hooks.event!({
+    event: { type: "session.status", properties: { sessionID, status: { type: "busy" } } } as never,
+  })
+  expect((await getGoalInternal(sessionID))?.pendingAttempt?.started).toBe(true)
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID } } as never })
+  expect((await getGoal(sessionID))?.continuationFailures).toBe(1)
+  expect((await getGoalInternal(sessionID))?.pendingAttempt).toBeNull()
 })
 
 test("assistant progress cancels no-pending transport recovery", async () => {
@@ -2492,6 +2622,59 @@ test("tool progress honors completed states and never resets on failed or incomp
   expect(String(plainSuccess)).toContain('"continuationFailures": 0')
 })
 
+test("delayed tool output from a prior turn cannot clear a newer pending attempt", async () => {
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async () => {},
+        },
+      },
+    } as never,
+    { auto_continue: false },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+  const sessionID = "ses_delayed_tool"
+  const context = { sessionID } as never
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, context)
+
+  // The tool call starts while attempt A is pending; the before hook captures
+  // the attempt id for this session+call key.
+  await reserveContinuation(sessionID, 10, 0)
+  await recordContinuationResult(sessionID, "success", 5)
+  const attemptA = (await getGoalInternal(sessionID))?.pendingAttempt?.id
+  expect(attemptA).toMatch(/^att_/)
+  await hooks["tool.execute.before"]!(
+    { tool: "bash", sessionID, callID: "call_delayed", args: {} } as never,
+    {} as never,
+  )
+
+  // A newer attempt B is reserved while the tool is still running.
+  await reserveContinuation(sessionID, 10, 0)
+  await recordContinuationResult(sessionID, "success", 5)
+  const attemptB = (await getGoalInternal(sessionID))?.pendingAttempt?.id
+  expect(attemptB).not.toBe(attemptA)
+
+  // The delayed output from the old call must leave attempt B pending.
+  await hooks["tool.execute.after"]!(
+    { tool: "bash", sessionID, callID: "call_delayed", args: {} } as never,
+    { title: "bash", output: "tests passed", metadata: {} } as never,
+  )
+  expect((await getGoalInternal(sessionID))?.pendingAttempt?.id).toBe(attemptB)
+
+  // A tool call that started while attempt B was pending clears it.
+  await hooks["tool.execute.before"]!(
+    { tool: "bash", sessionID, callID: "call_current", args: {} } as never,
+    {} as never,
+  )
+  await hooks["tool.execute.after"]!(
+    { tool: "bash", sessionID, callID: "call_current", args: {} } as never,
+    { title: "bash", output: "more progress", metadata: {} } as never,
+  )
+  expect((await getGoalInternal(sessionID))?.pendingAttempt).toBeNull()
+})
+
 test("watchdog rescues at most once per busy episode", async () => {
   const calls: unknown[] = []
   const hooks = await plugin.server(
@@ -2531,4 +2714,159 @@ test("watchdog rescues at most once per busy episode", async () => {
   })
   await waitFor(() => calls.length === 2)
   expect(calls).toHaveLength(2)
+})
+
+test("a busy that races prompt resolution correlates to the persisted attempt", async () => {
+  let resolvePrompt: (() => void) | undefined
+  const calls: unknown[] = []
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+            await new Promise<void>((resolve) => {
+              resolvePrompt = resolve
+            })
+          },
+        },
+      },
+    } as never,
+    { auto_continue: true, min_continue_interval_seconds: 0, max_prompt_failures: 3 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+  const context = { sessionID: "ses_busy_race" } as never
+
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, context)
+  // Start auto-continue; the prompt stays in flight inside session.promptAsync.
+  // Fire-and-forget: the idle handler awaits runAutoContinue which blocks on
+  // the unresolved prompt, so we must not await it here.
+  void hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_busy_race" } } as never })
+  await waitFor(() => calls.length === 1)
+
+  // A busy arrives BEFORE promptAsync resolves. Because the attempt is
+  // persisted before delivery, the busy correlates to the correct attempt and
+  // marks it started even though delivery has not finished yet.
+  await hooks.event!({
+    event: { type: "session.status", properties: { sessionID: "ses_busy_race", status: { type: "busy" } } } as never,
+  })
+  expect((await getGoalInternal("ses_busy_race"))?.pendingAttempt?.started).toBe(true)
+
+  // Delivery finishes; it must preserve the started flag set by the racing busy.
+  resolvePrompt?.()
+  await waitForLong(async () => (await getGoalInternal("ses_busy_race"))?.pendingAttempt?.delivered === true)
+  expect((await getGoalInternal("ses_busy_race"))?.pendingAttempt?.started).toBe(true)
+  expect(calls).toHaveLength(1)
+
+  await hooks.dispose?.()
+})
+
+test("dispose prevents an in-flight continuation from scheduling retries or committing turns", async () => {
+  let resolvePrompt: (() => void) | undefined
+  const calls: unknown[] = []
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+            await new Promise<void>((resolve) => {
+              resolvePrompt = resolve
+            })
+          },
+        },
+      },
+    } as never,
+    { auto_continue: true, min_continue_interval_seconds: 0, max_prompt_failures: 3 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+  const context = { sessionID: "ses_dispose" } as never
+
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, context)
+  void hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_dispose" } } as never })
+  await waitFor(() => calls.length === 1)
+
+  // Dispose while the prompt is in flight.
+  await hooks.dispose?.()
+  resolvePrompt?.()
+  await new Promise((resolve) => setTimeout(resolve, 100))
+
+  // No new timer/continuation and the reserved-but-not-delivered turn is rolled
+  // back so it neither consumes an autoTurn nor commits a continuation.
+  expect(calls).toHaveLength(1)
+  expect((await getGoal("ses_dispose"))?.autoTurns).toBe(0)
+  expect((await getGoalInternal("ses_dispose"))?.pendingAttempt).toBeNull()
+})
+
+test("dispose while a prompt is in flight rolls back on rejection without a failure", async () => {
+  let resolvePrompt: (() => void) | undefined
+  const logs: unknown[] = []
+  const calls: unknown[] = []
+  const hooks = await plugin.server(
+    {
+      client: {
+        app: { log: async (input: unknown) => logs.push(input) },
+        session: {
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+            await new Promise<void>((resolve) => {
+              resolvePrompt = resolve
+            })
+            throw new Error("network down")
+          },
+        },
+      },
+    } as never,
+    { auto_continue: true, min_continue_interval_seconds: 0, max_prompt_failures: 3 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+  const sessionID = "ses_dispose_reject"
+  const context = { sessionID } as never
+
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, context)
+  void hooks.event!({ event: { type: "session.idle", properties: { sessionID } } as never })
+  await waitFor(() => calls.length === 1)
+
+  // Dispose while the prompt is in flight, then let the prompt fail: the catch
+  // block must roll back the reserved attempt instead of counting a transport
+  // failure, scheduling a retry, or consuming an auto-turn.
+  await hooks.dispose?.()
+  resolvePrompt?.()
+  await new Promise((resolve) => setTimeout(resolve, 100))
+
+  expect(calls).toHaveLength(1)
+  expect(logs).toHaveLength(0)
+  expect((await getGoal(sessionID))?.autoTurns).toBe(0)
+  expect((await getGoal(sessionID))?.continuationFailures).toBe(0)
+  expect((await getGoal(sessionID))?.status).toBe("active")
+  expect((await getGoalInternal(sessionID))?.pendingAttempt).toBeNull()
+})
+
+test("the public goal tool result never exposes internal pending attempt fields", async () => {
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async () => {},
+        },
+      },
+    } as never,
+    { auto_continue: false },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+  const context = { sessionID: "ses_no_leak" } as never
+
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, context)
+  await reserveContinuation("ses_no_leak", 10, 0)
+  await recordContinuationResult("ses_no_leak", "success", 5)
+
+  const read = await requireTool(tools.get_goal, "get_goal").execute({}, context)
+  const text = String(read)
+  expect(text).not.toContain("pendingAttempt")
+  expect(text).not.toContain("pendingContinuationStart")
+  expect(text).not.toContain("pendingContinuationStarted")
 })
