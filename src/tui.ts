@@ -1,6 +1,8 @@
 import type { TuiCommand, TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
+import type { Plugin as TuiPluginV2 } from "@opencode-ai/plugin-v2/tui"
+import type { SessionMessageInfo } from "@opencode-ai/client"
 import { createElement, insert, setProp } from "@opentui/solid"
-import { createSignal, onCleanup } from "solid-js"
+import { createEffect, createMemo, createSignal, onCleanup } from "solid-js"
 
 type GoalCheckpoint = {
   summary: string
@@ -63,7 +65,7 @@ type GoalSessionState = {
   goal: GoalSnapshot | null
   messageIndex: number
 }
-type ElementChild = string | number | boolean | null | undefined | object | (() => string)
+type ElementChild = string | number | boolean | null | undefined | object | (() => ElementChild)
 
 type ModernTuiApi = TuiPluginApi & {
   keymap?: {
@@ -83,6 +85,17 @@ type ModernTuiApi = TuiPluginApi & {
 
 const goalCache = new Map<string, GoalSnapshot>()
 
+const GOAL_TOOL_NAMES: readonly string[] = [
+  "get_goal",
+  "get_goal_history",
+  "create_goal",
+  "set_goal",
+  "update_goal",
+  "update_goal_objective",
+  "update_goal_status",
+  "clear_goal",
+]
+
 function element(tag: string, props: Record<string, unknown>, children: ElementChild[] = []) {
   const node = createElement(tag)
   for (const [key, value] of Object.entries(props)) if (value !== undefined) setProp(node, key, value)
@@ -96,6 +109,61 @@ function text(props: Record<string, unknown>, children: ElementChild[]) {
 
 function box(props: Record<string, unknown>, children: ElementChild[] = []) {
   return element("box", props, children)
+}
+
+type SlotRender = (props: { sessionID: string }) => unknown
+type SlotDispose = () => void
+
+const noopDispose: SlotDispose = () => {}
+
+/**
+ * Registers a V2 TUI slot across both plugin-context generations.
+ *
+ * Early V2 previews exposed `ui.slot(name, render)`. Current previews expose a
+ * single options argument, `ui.slot({ append, render })`, and silently register
+ * nothing when handed the positional pair — which is how the goal sidebar and
+ * the palette keymap layer both disappeared. Branch on the callback arity so
+ * either host works, and tolerate hosts that return no disposer.
+ */
+export function registerSlotV2(context: TuiPluginV2.Context, name: string, render: SlotRender): SlotDispose {
+  const slot = context.ui.slot as unknown as (...args: unknown[]) => unknown
+  const dispose = slot.length <= 1 ? slot({ append: name, render }) : slot(name, render)
+  return typeof dispose === "function" ? (dispose as SlotDispose) : noopDispose
+}
+
+/**
+ * Reads a theme color by trying each candidate path in order, descending into a
+ * `default` leaf when the resolved node is a color group.
+ *
+ * Current previews expose a nested theme (`text.default`, `text.subdued`,
+ * `text.feedback.success`), while earlier previews and the V1 TUI expose flat
+ * keys (`text`, `textMuted`, `primary`). Passing a color *group* as `fg`
+ * renders nothing useful, so resolve to a leaf before handing it to OpenTUI.
+ */
+export function themeColorV2(theme: unknown, ...paths: readonly (readonly string[])[]): unknown {
+  for (const path of paths) {
+    let cursor: unknown = theme
+    for (const key of path) {
+      if (cursor === null || typeof cursor !== "object") {
+        cursor = undefined
+        break
+      }
+      cursor = (cursor as Record<string, unknown>)[key]
+    }
+    if (cursor !== null && typeof cursor === "object" && "default" in (cursor as Record<string, unknown>)) {
+      cursor = (cursor as Record<string, unknown>).default
+    }
+    if (cursor !== undefined && cursor !== null) return cursor
+  }
+  return undefined
+}
+
+function goalColorsV2(theme: unknown) {
+  return {
+    text: themeColorV2(theme, ["text", "default"], ["text"]),
+    muted: themeColorV2(theme, ["text", "subdued"], ["textMuted"]),
+    achieved: themeColorV2(theme, ["text", "feedback", "success"], ["primary"], ["text", "default"], ["text"]),
+  }
 }
 
 function goalSnapshotKey(sessionID: string) {
@@ -280,19 +348,7 @@ function isGoalSnapshot(value: unknown): value is GoalSnapshot {
 
 function parseGoalToolOutput(part: GoalToolPart): GoalSnapshot | null | undefined {
   if (part.type !== "tool") return undefined
-  if (
-    ![
-      "get_goal",
-      "get_goal_history",
-      "create_goal",
-      "set_goal",
-      "update_goal",
-      "update_goal_objective",
-      "update_goal_status",
-      "clear_goal",
-    ].includes(part.tool ?? "")
-  )
-    return undefined
+  if (!GOAL_TOOL_NAMES.includes(part.tool ?? "")) return undefined
   if (part.state?.status !== "completed") return undefined
   if (part.tool === "clear_goal") return null
   if (typeof part.state.output !== "string") return undefined
@@ -419,9 +475,172 @@ const tui: TuiPlugin = async (api) => {
   })
 }
 
-const plugin: TuiPluginModule = {
+// --- V2 TUI plugin ---
+
+/**
+ * Scans the V2 session message list for the newest completed goal tool result.
+ * Assistant tool content entries carry `name` plus a completed `state.content`
+ * array; goal tool output is serialized in text ToolContent parts. Returns
+ * `undefined` when no goal tool output is present (so callers can fall back to
+ * a cached snapshot), `null` after a completed clear_goal, or the snapshot.
+ */
+export function goalFromV2Messages(messages: readonly SessionMessageInfo[]): GoalSnapshot | null | undefined {
+  for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
+    const message = messages[messageIndex]
+    if (!message || message.type !== "assistant") continue
+    const parts = message.content
+    for (let partIndex = parts.length - 1; partIndex >= 0; partIndex -= 1) {
+      const part = parts[partIndex]
+      if (!part || part.type !== "tool") continue
+      if (!GOAL_TOOL_NAMES.includes(part.name)) continue
+      if (part.state.status !== "completed") continue
+      if (part.name === "clear_goal") return null
+      const textContent = part.state.content.find((entry) => entry.type === "text")
+      if (!textContent) continue
+      try {
+        const parsed: unknown = JSON.parse(textContent.text)
+        if (!isRecord(parsed)) continue
+        if (parsed.goal === null) return null
+        if (isGoalSnapshot(parsed.goal)) return parsed.goal
+      } catch {
+        // Malformed tool output: keep scanning older tool entries.
+      }
+    }
+  }
+  return undefined
+}
+
+function currentSessionIDV2(api: TuiPluginV2.Context) {
+  const route = api.ui.router.current()
+  if (route.type !== "session") return undefined
+  return route.sessionID
+}
+
+function toastV2(api: TuiPluginV2.Context, message: string, variant: "info" | "success" | "warning" | "error" = "info") {
+  api.ui.toast.show({ title: "Goal", message, variant, duration: 2500 })
+}
+
+async function showSummaryV2(api: TuiPluginV2.Context, sessionID: string, goal: GoalSnapshot | null) {
+  const options = [
+    { title: "Refresh", value: "refresh", description: "Ask the agent to read the current goal state" },
+    ...(goal
+      ? [
+          { title: "History", value: "history", description: "Ask the agent to show lifecycle history" },
+          ...(goal.status === "active"
+            ? [{ title: "Pause", value: "pause", description: "Pause auto-continuation without clearing" }]
+            : []),
+          ...(goal.status === "paused" || goal.status === "budgetLimited" || goal.status === "usageLimited"
+            ? [{ title: "Resume", value: "resume", description: "Resume the goal and continue" }]
+            : []),
+          { title: "Clear", value: "clear", description: "Ask the agent to clear this session goal" },
+        ]
+      : []),
+  ]
+  api.ui.dialog.set({ size: "large" })
+  const selected = await api.ui.dialog.select({ title: "Goal", placeholder: formatGoal(goal), options })
+  const prompt = selected === "refresh" ? refreshGoalPrompt()
+    : selected === "history" ? historyGoalPrompt()
+    : selected === "pause" ? pauseGoalPrompt()
+    : selected === "resume" ? resumeGoalPrompt()
+    : selected === "clear" ? clearGoalPrompt()
+    : undefined
+  if (!prompt) return
+  try {
+    await api.client.session.prompt({ sessionID, text: prompt })
+  } catch (error) {
+    toastV2(api, error instanceof Error ? error.message : String(error), "error")
+  }
+}
+
+function GoalSidebarV2(api: TuiPluginV2.Context, sessionID: string) {
+  const colors = goalColorsV2(api.theme)
+  const [cache, setCache] = api.storage.memory<{ goal: GoalSnapshot | null }>(`goal-mode.v2.${sessionID}`, {
+    initial: { goal: null },
+  })
+  const goal = createMemo<GoalSnapshot | null>(() => {
+    const found = goalFromV2Messages(api.data.session.message.list(sessionID))
+    return found === undefined ? cache.goal : found
+  })
+  createEffect(() =>
+    setCache((draft) => {
+      draft.goal = goal()
+    }),
+  )
+
+  const [nowSeconds, setNowSeconds] = createSignal(currentEpochSeconds())
+  createEffect(() => {
+    if (goal()?.status !== "active") return
+    const timer = setInterval(() => setNowSeconds(currentEpochSeconds()), 1000)
+    onCleanup(() => clearInterval(timer))
+  })
+  return box({}, [() => {
+    const snapshot = goal()
+    if (!snapshot) return null
+    if (snapshot.status === "complete" || snapshot.status === "unmet") {
+      const elapsed = liveTimeUsedSeconds(snapshot)
+      return text({ fg: snapshot.status === "complete" ? colors.achieved : colors.muted }, [
+        `${snapshot.status === "complete" ? "Goal achieved" : "Goal unmet"} (${formatDurationBadge(elapsed)})`,
+      ])
+    }
+    return box({}, [
+      text({ fg: colors.text }, ["Goal"]),
+      text({ fg: colors.muted }, [`Status: ${snapshot.status}`]),
+      text({ fg: colors.muted }, [`Time: ${formatDuration(liveTimeUsedSeconds(snapshot, nowSeconds()))}`]),
+      text({ fg: colors.muted }, [`Tokens: ${snapshot.tokensUsed}${snapshot.tokenBudget == null ? "" : `/${snapshot.tokenBudget}`}`]),
+      text({ fg: colors.muted }, [`Auto-continues: ${snapshot.autoTurns}${snapshot.maxAutoTurns == null ? "" : `/${snapshot.maxAutoTurns}`}`]),
+      ...(snapshot.lastCheckpoint ? [text({ fg: colors.muted }, [`Checkpoint: ${snapshot.lastCheckpoint.summary}`])] : []),
+      ...(snapshot.stopReason ? [text({ fg: colors.muted }, [`Stop: ${snapshot.stopReason}`])] : []),
+      ...(snapshot.lastStatus ? [text({ fg: colors.muted }, [snapshot.lastStatus])] : []),
+      text({ fg: colors.muted }, [snapshot.objective]),
+    ])
+  }])
+}
+
+function GoalKeymapLayerV2(api: TuiPluginV2.Context) {
+  api.keymap.layer(() => ({
+    mode: "global",
+    commands: [
+      {
+        id: "goal.show",
+        title: "Goal",
+        description: "View, pause, resume, or clear the long-running session goal",
+        group: "Goal",
+        palette: true,
+        run: () => {
+          const sessionID = currentSessionIDV2(api)
+          if (!sessionID) {
+            toastV2(api, "Open a session before viewing goal state.", "warning")
+            return
+          }
+          void showSummaryV2(api, sessionID, goalFromV2Messages(api.data.session.message.list(sessionID)) ?? null)
+        },
+      },
+    ],
+  }))
+  return null
+}
+
+/**
+ * V2 TUI setup: registers the goal sidebar via `ui.slot` and a palette command
+ * through a keymap layer mounted from the global `app` slot. `keymap.layer`
+ * must be invoked from a Solid component scope, so the layer lives inside a
+ * component rendered by the `app` slot; its cleanup is owned by that component
+ * and released automatically when the slot unmounts. The setup cleanup only
+ * needs to dispose the two `ui.slot` registrations.
+ */
+export function setupTuiV2(context: TuiPluginV2.Context): TuiPluginV2.Cleanup {
+  const offSidebar = registerSlotV2(context, "sidebar.content", (props) => GoalSidebarV2(context, props.sessionID))
+  const offApp = registerSlotV2(context, "app", () => GoalKeymapLayerV2(context))
+  return () => {
+    offSidebar()
+    offApp()
+  }
+}
+
+const plugin: TuiPluginModule & TuiPluginV2.Definition = {
   id: "local.goal-mode.tui",
   tui,
+  setup: setupTuiV2,
 }
 
 export default plugin

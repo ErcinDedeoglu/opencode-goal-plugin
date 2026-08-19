@@ -38,7 +38,18 @@ Common use cases:
 
 ## Install
 
-Install locally for the current OpenCode project:
+Choose the instructions that match the CLI you run:
+
+| OpenCode version | How to identify it | Instructions |
+| --- | --- | --- |
+| OpenCode 1 stable | You run `opencode` and `opencode --version` prints `1.x` | [OpenCode 1](#opencode-1-stable) |
+| OpenCode 2 beta | You run `opencode2` | [OpenCode 2](#opencode-2-beta) |
+
+Do not mix the configuration formats. OpenCode 1 uses `plugin` and `tui.json`; OpenCode 2 uses `plugins` and the global `cli.json`.
+
+### OpenCode 1 Stable
+
+Install for the current project:
 
 ```bash
 opencode plugin @prevalentware/opencode-goal-plugin
@@ -52,9 +63,7 @@ opencode plugin -g @prevalentware/opencode-goal-plugin
 
 OpenCode detects both package entrypoints and writes the plugin into the server and TUI config targets.
 
-## Manual Config
-
-If you configure it manually, add the package to both config files.
+For manual installation, add the package to both V1 config files.
 
 `opencode.json`:
 
@@ -72,9 +81,35 @@ If you configure it manually, add the package to both config files.
 }
 ```
 
+### OpenCode 2 Beta
+
+Use this section only when running `opencode2`. Plugin release `0.1.30` and newer supports OpenCode 2 preview `0.0.0-next-17055` while remaining compatible with OpenCode 1.
+
+Add the package to both V2 plugin lists:
+
+`opencode.json`:
+
+```json
+{
+  "plugins": ["@prevalentware/opencode-goal-plugin"]
+}
+```
+
+`~/.config/opencode/cli.json`:
+
+```json
+{
+  "plugins": ["@prevalentware/opencode-goal-plugin"]
+}
+```
+
+OpenCode 2 does not read the V1 `tui.json` file. The server entrypoint comes from `opencode.json`, while the sidebar and palette integration come from `~/.config/opencode/cli.json`.
+
+OpenCode 2 plugin APIs are still beta. This package pins its V2 development contract to the preview version above; later previews may require a compatible plugin update. V2 currently supports the goal command, tools, persistent state, usage accounting, idle continuation, Plan-mode safety, and TUI sidebar/palette integration. Goal-specific compaction context and recovery of already-running child sessions after a plugin restart remain V1-only because the current V2 plugin context does not expose equivalent hooks or history queries.
+
 ## Options
 
-Server options can be configured in `opencode.json`:
+In OpenCode 1, server options use the package-and-options tuple in `opencode.json`:
 
 ```json
 {
@@ -96,6 +131,24 @@ Server options can be configured in `opencode.json`:
         "allow_goal_execution_from_plan": false
       }
     ]
+  ]
+}
+```
+
+In OpenCode 2, use the plugin object form instead:
+
+```json
+{
+  "plugins": [
+    {
+      "package": "@prevalentware/opencode-goal-plugin",
+      "options": {
+        "auto_continue": true,
+        "max_auto_turns": 25,
+        "default_token_budget": 200000,
+        "restricted_agents": ["plan"]
+      }
+    }
   ]
 }
 ```
