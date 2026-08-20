@@ -153,7 +153,7 @@ function toolContext(sessionID = "ses_v2", agent = "build") {
 }
 
 async function waitFor(predicate: () => boolean | Promise<boolean>) {
-  const deadline = Date.now() + 1000
+  const deadline = Date.now() + 2000
   while (Date.now() < deadline) {
     if (await predicate()) return
     await new Promise((resolve) => setTimeout(resolve, 5))

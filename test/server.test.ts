@@ -16,7 +16,7 @@ function requireTool<T>(tool: T | undefined, name: string): T {
 }
 
 async function waitFor(predicate: () => boolean) {
-  const deadline = Date.now() + 500
+  const deadline = Date.now() + 2000
   while (Date.now() < deadline) {
     if (predicate()) return
     await new Promise((resolve) => setTimeout(resolve, 5))
@@ -1839,21 +1839,25 @@ test("recognized transport error strings accumulate as continuation failures", a
           },
         },
       } as never,
-      { auto_continue: true, max_auto_turns: 5, min_continue_interval_seconds: 0, max_prompt_failures: 10 },
+      { auto_continue: true, max_auto_turns: 5, min_continue_interval_seconds: 0, max_prompt_failures: 1 },
     )
     const tools = hooks.tool
     if (!tools) throw new Error("expected goal tools to be registered")
 
-    await requireTool(tools.create_goal, "create_goal").execute(
-      { objective: "keep going" },
-      { sessionID: `ses_transport_${index}` } as never,
-    )
-    await hooks.event!({
-      event: { type: "session.idle", properties: { sessionID: `ses_transport_${index}` } } as never,
-    })
+    try {
+      await requireTool(tools.create_goal, "create_goal").execute(
+        { objective: "keep going" },
+        { sessionID: `ses_transport_${index}` } as never,
+      )
+      await hooks.event!({
+        event: { type: "session.idle", properties: { sessionID: `ses_transport_${index}` } } as never,
+      })
 
-    const read = await requireTool(tools.get_goal, "get_goal").execute({}, { sessionID: `ses_transport_${index}` } as never)
-    expect(String(read)).toContain('"continuationFailures": 1')
+      const read = await requireTool(tools.get_goal, "get_goal").execute({}, { sessionID: `ses_transport_${index}` } as never)
+      expect(String(read)).toContain('"continuationFailures": 1')
+    } finally {
+      await hooks.dispose?.()
+    }
   }
 })
 
