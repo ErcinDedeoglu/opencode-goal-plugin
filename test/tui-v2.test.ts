@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test"
+import { DEFAULT_THEME, resolveThemeDocument, type ResolvedTheme } from "@opencode-ai/theme/tui"
 import { testRender } from "@opentui/solid"
 import { createSignal } from "solid-js"
 import { createStore, type Store } from "solid-js/store"
@@ -111,13 +112,7 @@ type MockContext = {
     }
   }
   attention: unknown
-  theme: {
-    text: {
-      default: string
-      subdued: string
-      feedback: { success: { default: string } }
-    }
-  }
+  theme: ResolvedTheme
   markdown: unknown
   keymap: {
     layer: (input: () => MockKeymapLayer) => void
@@ -197,13 +192,7 @@ function makeMockContext(overrides: Partial<MockContext> = {}): {
       },
     },
     attention: undefined,
-    theme: {
-      text: {
-        default: "#ffffff",
-        subdued: "#888888",
-        feedback: { success: { default: "#00ff00" } },
-      },
-    },
+    theme: resolveThemeDocument(DEFAULT_THEME, "dark"),
     markdown: undefined,
     keymap: {
       layer(input) {
