@@ -210,15 +210,36 @@ function isMissingStateFile(error) {
 function mutableState(state) {
   return JSON.parse(JSON.stringify(state));
 }
+var warnedEmptyStatePaths = new Set;
+function isStatePadding(character) {
+  return character === "\x00" || character.trim() === "";
+}
+function parseStateText(raw, file) {
+  let start = 0;
+  let end = raw.length;
+  while (start < end && isStatePadding(raw[start]))
+    start += 1;
+  while (end > start && isStatePadding(raw[end - 1]))
+    end -= 1;
+  const content = raw.slice(start, end);
+  if (content)
+    return JSON.parse(content);
+  if (!warnedEmptyStatePaths.has(file)) {
+    warnedEmptyStatePaths.add(file);
+    console.warn(`[opencode-goal-plugin] Empty or zero-filled state file at ${file}; recovering with empty state.`);
+  }
+  return emptyState();
+}
 function decodeState(value) {
   return Schema.decodeUnknown(StateSchema)(value).pipe(Effect.map(mutableState), Effect.map(normalizeState), Effect.mapError((cause) => new StateDecodeError({ cause })));
 }
 function readStateEffect() {
+  const file = statePath();
   return Effect.tryPromise({
-    try: () => readFile(statePath(), "utf8"),
+    try: () => readFile(file, "utf8"),
     catch: (cause) => new StateReadError({ cause })
   }).pipe(Effect.flatMap((raw) => Effect.try({
-    try: () => JSON.parse(raw),
+    try: () => parseStateText(raw, file),
     catch: (cause) => new StateDecodeError({ cause })
   })), Effect.flatMap(decodeState), Effect.catchAll((error) => error._tag === "StateReadError" && isMissingStateFile(error.cause) ? Effect.succeed(emptyState()) : Effect.fail(error)));
 }
