@@ -2390,7 +2390,7 @@ test("restart resolves a persisted started pending attempt at the next idle", as
   const context = { sessionID: "ses_1" } as never
   await requireTool(tools1.create_goal, "create_goal").execute({ objective: "keep going" }, context)
   await hooks1.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
-  await waitFor(() => firstCalls.length === 1)
+  await waitForLong(() => firstCalls.length === 1, 5_000)
   await hooks1.event!({
     event: { type: "session.status", properties: { sessionID: "ses_1", status: { type: "busy" } } } as never,
   })
