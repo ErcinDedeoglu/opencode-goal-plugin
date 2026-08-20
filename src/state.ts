@@ -1,8 +1,9 @@
 import { readFileSync } from "node:fs"
-import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises"
+import { mkdir, readFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import { Data, Effect, Schema } from "effect"
+import { atomicWriteFile } from "./atomic-write"
 
 export type GoalStatus = "active" | "paused" | "budgetLimited" | "usageLimited" | "complete" | "unmet"
 export type MutableGoalStatus = "active" | "paused"
@@ -284,10 +285,17 @@ function writeStateEffect(state: State) {
     try: async () => {
       const file = statePath()
       await mkdir(dirname(file), { recursive: true, mode: 0o700 })
-      const tmp = `${file}.${process.pid}.${Date.now()}.tmp`
-      await writeFile(tmp, JSON.stringify(state, null, 2) + "\n", { mode: 0o600 })
-      await rename(tmp, file)
-      await chmod(file, 0o600).catch(() => undefined)
+      // atomicWriteFile writes to a same-directory temp file, fsyncs it, then
+      // renames it into place: the final path is only ever replaced by a
+      // fully-flushed file, so after a process or OS crash the state is the
+      // old or the new valid version, never a torn or empty file. Ordinary
+      // fsync improves crash consistency but is not `F_FULLFSYNC`, so sudden
+      // power loss on macOS/APFS has no absolute durability guarantee. Where
+      // the platform supports it, the parent directory is also fsync'd after
+      // the rename so the rename itself survives a crash; where it does not
+      // (Windows / some filesystems) the write still succeeds and a crash
+      // leaves either the old or the new valid state, never a torn file.
+      await atomicWriteFile(file, JSON.stringify(state, null, 2) + "\n")
     },
     catch: (cause) => new StateWriteError({ cause }),
   })
