@@ -10,6 +10,7 @@ const TOOL_NAMES = [
   "create_goal",
   "get_goal",
   "get_goal_history",
+  "list_all_goals",
   "set_goal",
   "update_goal",
   "update_goal_objective",
@@ -225,6 +226,28 @@ test("V2 setup registers goal tools with JSON Schema inputs, codemode:false, and
   mock.stream.end()
   await cleanup()
   expect(mock.promptCalls).toHaveLength(0)
+})
+
+test("V2 list_all_goals returns goals from other sessions", async () => {
+  const mock = makeMockContext({ auto_continue: false })
+  const cleanup = await plugin.setup(mock as never)
+  await goalTool(mock, "create_goal").execute(
+    { objective: "first V2 session goal" },
+    toolContext("ses_first"),
+  )
+  await goalTool(mock, "create_goal").execute(
+    { objective: "second V2 session goal" },
+    toolContext("ses_second"),
+  )
+
+  const listed = await goalTool(mock, "list_all_goals").execute({}, toolContext("ses_observer"))
+
+  expect(contentOf(listed)).toContain('"sessionID": "ses_first"')
+  expect(contentOf(listed)).toContain('"sessionID": "ses_second"')
+  expect(contentOf(listed)).not.toContain("usageTrackers")
+  expect(contentOf(listed)).not.toContain("pendingAttempt")
+  mock.stream.end()
+  await cleanup()
 })
 
 test("V2 create_goal recovers from a zero-filled state file", async () => {

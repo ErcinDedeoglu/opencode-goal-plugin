@@ -11,6 +11,7 @@ import {
   createGoal,
   estimateTokensFromText,
   formatGoalHistory,
+  getAllGoals,
   getGoal,
   getGoalInternal,
   markGoalUnmet,
@@ -78,7 +79,7 @@ const RETRY_SETTLE_MS = 25
 const TRANSPORT_ERROR_PATTERN =
   /\b(?:network|fetch|socket|connect|connection|timeout|timed out|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|EPIPE|transport|stream|websocket|offline|internet|request failed|proxy)\b/i
 const NON_TRANSPORT_TERMINAL_PATTERN = /\b(?:abort(?:ed)?|interrupt(?:ed|ion)?)\b/i
-const NON_PROGRESS_TOOLS = new Set(["get_goal", "get_goal_history"])
+const NON_PROGRESS_TOOLS = new Set(["get_goal", "get_goal_history", "list_all_goals"])
 const TASK_TERMINAL_STATES = new Set<TaskState>(["completed", "error", "cancelled"])
 const PLAN_MODE_CREATE_NOTICE =
   'Goal recorded while the session is in Plan mode, so execution is paused. Do not start implementation work now. Ask the user to switch to Build mode and resume the goal (for example with "/goal resume") to begin execution.'
@@ -1265,6 +1266,14 @@ const server: Plugin = async ({ client }, options?: Options) => {
           return JSON.stringify({ goal, history_report: formatGoalHistory(goal) }, null, 2)
         },
       },
+      list_all_goals: {
+        description:
+          "List up to 50 public goal summaries across all sessions in this state file, ordered by most recently updated first. Elapsed time is the last persisted value; total and truncated report omitted older goals.",
+        args: {},
+        async execute() {
+          return JSON.stringify(await getAllGoals(), null, 2)
+        },
+      },
       create_goal: {
         description:
           "Create a goal only when explicitly requested by the user or system/developer instructions; do not infer goals from ordinary tasks. If any non-closed goal exists, this returns the existing goal as either reused or conflicting and must not be retried. While the session is in Plan mode, the goal is recorded as paused and execution requires the user to switch to Build mode.",
@@ -2207,6 +2216,16 @@ function goalToolsV2(services: GoalServices): ToolV2Info[] {
         const goal = await getGoal(toolContext.sessionID)
         return { content: JSON.stringify({ goal, history_report: formatGoalHistory(goal) }, null, 2) }
       },
+    },
+    {
+      name: "list_all_goals",
+      description:
+        "List up to 50 public goal summaries across all sessions in this state file, ordered by most recently updated first. Elapsed time is the last persisted value; total and truncated report omitted older goals.",
+      input: v2ObjectSchema({}),
+      options: { codemode: false },
+      execute: async () => ({
+        content: JSON.stringify(await getAllGoals(), null, 2),
+      }),
     },
     {
       name: "create_goal",
