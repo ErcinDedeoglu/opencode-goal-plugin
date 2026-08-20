@@ -152,12 +152,20 @@ var PendingAttemptSchema = Schema.Struct({
   armNoProgress: Schema.Boolean,
   previousLastContinuationAt: Schema.NullOr(Schema.Number)
 });
+var UsageTrackerSchema = Schema.Struct({
+  baseline: Schema.optionalWith(Schema.Unknown, { default: () => null }),
+  lastObserved: Schema.optionalWith(Schema.Unknown, { default: () => null }),
+  baseTokens: Schema.optionalWith(Schema.Unknown, { default: () => null }),
+  pendingBaseline: Schema.optionalWith(Schema.Unknown, { default: () => null }),
+  pendingBaseTokens: Schema.optionalWith(Schema.Unknown, { default: () => null })
+});
 var GoalSchema = Schema.Struct({
   sessionID: Schema.String,
   objective: Schema.String,
   status: Schema.Literal("active", "paused", "budgetLimited", "usageLimited", "complete", "unmet"),
   tokenBudget: NullableNumber,
   tokensUsed: Schema.Number,
+  usageTrackers: Schema.optionalWith(Schema.Record({ key: Schema.String, value: UsageTrackerSchema }), { default: () => ({}) }),
   timeUsedSeconds: Schema.Number,
   createdAt: Schema.Number,
   updatedAt: Schema.Number,
@@ -315,11 +323,33 @@ function normalizeGoal(goal) {
   goal.maxAutoTurns = positiveIntegerOrNull(goal.maxAutoTurns);
   goal.maxDurationSeconds = positiveIntegerOrNull(goal.maxDurationSeconds);
   goal.tokenBudget = positiveIntegerOrNull(goal.tokenBudget);
+  goal.usageTrackers = normalizeUsageTrackers(goal.usageTrackers);
   goal.noProgressTokenThreshold = positiveIntegerOrNull(goal.noProgressTokenThreshold) ?? DEFAULT_NO_PROGRESS_TOKEN_THRESHOLD;
   goal.maxNoProgressTurns = positiveIntegerOrNull(goal.maxNoProgressTurns) ?? DEFAULT_MAX_NO_PROGRESS_TURNS;
   goal.budgetWrapupSent = goal.budgetWrapupSent === true;
   goal.stopReason ??= null;
   return goal;
+}
+function normalizeUsageTrackers(trackers) {
+  const normalized = {};
+  for (const [source, rawTracker] of Object.entries(trackers ?? {})) {
+    const tracker = rawTracker;
+    const baseline = nonNegativeIntegerOrNull(tracker?.baseline);
+    const lastObserved = nonNegativeIntegerOrNull(tracker?.lastObserved);
+    const baseTokens = nonNegativeIntegerOrNull(tracker?.baseTokens);
+    if (source && baseline != null && lastObserved != null && baseTokens != null && lastObserved >= baseline) {
+      const pendingBaseline = nonNegativeIntegerOrNull(tracker.pendingBaseline);
+      const pendingBaseTokens = nonNegativeIntegerOrNull(tracker.pendingBaseTokens);
+      normalized[source] = {
+        baseline,
+        lastObserved,
+        baseTokens,
+        pendingBaseline,
+        pendingBaseTokens: pendingBaseline == null ? null : pendingBaseTokens
+      };
+    }
+  }
+  return normalized;
 }
 function normalizePendingAttempt(attempt) {
   if (!attempt || typeof attempt !== "object")
@@ -364,6 +394,9 @@ function positiveIntegerOrNull(value) {
 }
 function nonNegativeInteger(value, fallback) {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : fallback;
+}
+function nonNegativeIntegerOrNull(value) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
 function isClosed(status) {
   return status === "complete" || status === "unmet";
@@ -444,6 +477,7 @@ async function createGoal(sessionID, objective, options) {
       status: normalizedOptions.initialStatus,
       tokenBudget: normalizedOptions.tokenBudget,
       tokensUsed: 0,
+      usageTrackers: {},
       timeUsedSeconds: 0,
       createdAt: now,
       updatedAt: now,
@@ -605,14 +639,66 @@ async function clearGoal(sessionID) {
     return existed;
   });
 }
-async function accountUsage(sessionID, tokensUsed) {
+async function accountUsage(sessionID, tokensUsed, options) {
   return mutate((state) => {
     const goal = state.goals[sessionID];
     if (!goal)
       return null;
     accountWallClock(goal);
     if (typeof tokensUsed === "number" && Number.isFinite(tokensUsed)) {
-      goal.tokensUsed = Math.max(goal.tokensUsed, Math.max(0, Math.ceil(tokensUsed)));
+      const observed = Math.max(0, Math.ceil(tokensUsed));
+      if (options?.cumulative === true) {
+        const source = options.source?.trim() || "default";
+        let tracker = goal.usageTrackers[source];
+        if (!tracker) {
+          const initialBaseline = nonNegativeIntegerOrNull(options.initialBaseline);
+          tracker = initialBaseline != null && initialBaseline <= observed ? {
+            baseline: initialBaseline,
+            lastObserved: observed,
+            baseTokens: goal.tokensUsed,
+            pendingBaseline: null,
+            pendingBaseTokens: null
+          } : {
+            baseline: observed,
+            lastObserved: observed,
+            baseTokens: goal.tokensUsed,
+            pendingBaseline: null,
+            pendingBaseTokens: null
+          };
+          goal.usageTrackers[source] = tracker;
+        } else if (observed < tracker.lastObserved) {
+          const initialBaseline = nonNegativeIntegerOrNull(options.initialBaseline);
+          if (initialBaseline != null && initialBaseline <= observed) {
+            tracker = {
+              baseline: initialBaseline,
+              lastObserved: observed,
+              baseTokens: goal.tokensUsed,
+              pendingBaseline: null,
+              pendingBaseTokens: null
+            };
+            goal.usageTrackers[source] = tracker;
+          } else if (tracker.pendingBaseline == null || observed < tracker.pendingBaseline) {
+            tracker.pendingBaseline = observed;
+            tracker.pendingBaseTokens = goal.tokensUsed;
+          } else {
+            tracker = {
+              baseline: tracker.pendingBaseline,
+              lastObserved: observed,
+              baseTokens: tracker.pendingBaseTokens ?? goal.tokensUsed,
+              pendingBaseline: null,
+              pendingBaseTokens: null
+            };
+            goal.usageTrackers[source] = tracker;
+          }
+        } else {
+          tracker.lastObserved = observed;
+          tracker.pendingBaseline = null;
+          tracker.pendingBaseTokens = null;
+        }
+        goal.tokensUsed = Math.max(goal.tokensUsed, tracker.baseTokens + observed - tracker.baseline);
+      } else {
+        goal.tokensUsed = Math.max(goal.tokensUsed, observed);
+      }
     }
     maybeStopForBudget(goal);
     goal.updatedAt = nowSeconds();
@@ -1097,7 +1183,7 @@ function commandNameFromOptions(options) {
 function positiveIntegerOrNull2(value) {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : null;
 }
-function nonNegativeIntegerOrNull(value) {
+function nonNegativeIntegerOrNull2(value) {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
 function timeoutMillisecondsFromSeconds(value) {
@@ -1190,9 +1276,9 @@ function outputTokensFromMessage(message) {
     return outputTokensFromRecord(message.info.tokens);
   return;
 }
-function tokensFromMessages(messages) {
+function usageFromMessages(messages) {
   const exactTotal = messages.reduce((sum, message) => sum + (exactTokensFromMessage(message) ?? 0), 0);
-  return exactTotal > 0 ? exactTotal : estimateMessages(messages);
+  return exactTotal > 0 ? { tokens: exactTotal, source: "v1.messages.exact" } : { tokens: estimateMessages(messages), source: "v1.messages.estimated" };
 }
 function taskHeader(output) {
   const resultIndex = output.search(/<task_(?:result|error)>/);
@@ -1696,6 +1782,7 @@ async function createGoalFromTool(input, context, services) {
     agent: typeof context.agent === "string" ? context.agent : null,
     initialStatus: planningOnly ? "paused" : "active"
   });
+  await services.initializeUsage?.(context.sessionID);
   return JSON.stringify(planningOnly ? { goal, plan_mode_notice: PLAN_MODE_CREATE_NOTICE } : { goal }, null, 2);
 }
 async function updateGoalObjectiveFromTool(input, context, services) {
@@ -1758,7 +1845,7 @@ var server = async ({ client }, options) => {
   const autoContinue = options?.auto_continue ?? true;
   const deferWhileTasksActive = options?.defer_while_tasks_active ?? true;
   const maxAutoTurns = positiveIntegerOrNull2(options?.max_auto_turns) ?? DEFAULT_MAX_AUTO_TURNS;
-  const minInterval = nonNegativeIntegerOrNull(options?.min_continue_interval_seconds) ?? DEFAULT_CONTINUE_INTERVAL_SECONDS;
+  const minInterval = nonNegativeIntegerOrNull2(options?.min_continue_interval_seconds) ?? DEFAULT_CONTINUE_INTERVAL_SECONDS;
   const maxTurnTimeMs = timeoutMillisecondsFromSeconds(options?.max_turn_time);
   const maxPromptFailures = positiveIntegerOrNull2(options?.max_prompt_failures) ?? DEFAULT_MAX_PROMPT_FAILURES;
   const registerCommand = options?.register_command ?? true;
@@ -2167,7 +2254,8 @@ var server = async ({ client }, options) => {
       const sessionID = "sessionID" in input && typeof input.sessionID === "string" ? input.sessionID : output.messages.find((message) => typeof message.info.sessionID === "string")?.info.sessionID;
       if (!sessionID)
         return;
-      await accountUsage(sessionID, tokensFromMessages(output.messages));
+      const usage = usageFromMessages(output.messages);
+      await accountUsage(sessionID, usage.tokens, { cumulative: true, source: usage.source });
       const observed = await recordAssistantMessage(sessionID, latestAssistantMessage(output.messages), options ?? {});
       await reconcileLocalMarkerAfterProgress(locallyDeliveredPendingSessions, sessionID, observed.goal);
       const scheduled = scheduledContinuations.get(sessionID);
@@ -2298,7 +2386,7 @@ async function setupV2(context) {
   const autoContinue = options.auto_continue ?? true;
   const deferWhileTasksActive = options.defer_while_tasks_active ?? true;
   const maxAutoTurns = positiveIntegerOrNull2(options.max_auto_turns) ?? DEFAULT_MAX_AUTO_TURNS;
-  const minInterval = nonNegativeIntegerOrNull(options.min_continue_interval_seconds) ?? DEFAULT_CONTINUE_INTERVAL_SECONDS;
+  const minInterval = nonNegativeIntegerOrNull2(options.min_continue_interval_seconds) ?? DEFAULT_CONTINUE_INTERVAL_SECONDS;
   const maxTurnTimeMs = timeoutMillisecondsFromSeconds(options.max_turn_time);
   const maxPromptFailures = positiveIntegerOrNull2(options.max_prompt_failures) ?? DEFAULT_MAX_PROMPT_FAILURES;
   const registerCommand = options.register_command ?? true;
@@ -2314,11 +2402,21 @@ async function setupV2(context) {
   const toolAttempts = new Map;
   const planAgents = restrictedAgentSet(options);
   const isPlanAgent = (agent) => typeof agent === "string" && planAgents.has(agent.trim().toLowerCase());
-  const goalServices = { options, isPlanAgent };
   const activeContinuationsV2 = new Set;
   const latestStepBySession = new Map;
   const stepTextBuffers = new Map;
   const stepTokenSums = new Map;
+  const goalServices = {
+    options,
+    isPlanAgent,
+    initializeUsage: async (sessionID) => {
+      try {
+        await accountUsage(sessionID, stepTokenSums.get(sessionID) ?? 0, { cumulative: true, source: "v2.steps" });
+      } catch (error) {
+        v2ErrorLog("Failed to initialize goal usage accounting", error);
+      }
+    }
+  };
   const registrations = [];
   let disposed = false;
   function stepKey(sessionID, messageID2) {
@@ -2719,7 +2817,11 @@ async function setupV2(context) {
         if (typeof tokens === "number") {
           const sum = (stepTokenSums.get(sessionID) ?? 0) + tokens;
           stepTokenSums.set(sessionID, sum);
-          await accountUsage(sessionID, sum);
+          await accountUsage(sessionID, sum, {
+            cumulative: true,
+            source: "v2.steps",
+            initialBaseline: Math.ceil(sum - tokens)
+          });
         }
         const text = stepTextBuffers.get(stepKey(sessionID, messageID2)) ?? "";
         stepTextBuffers.delete(stepKey(sessionID, messageID2));
@@ -2755,7 +2857,11 @@ async function setupV2(context) {
         if (typeof tokens === "number") {
           const sum = (stepTokenSums.get(sessionID) ?? 0) + tokens;
           stepTokenSums.set(sessionID, sum);
-          await accountUsage(sessionID, sum);
+          await accountUsage(sessionID, sum, {
+            cumulative: true,
+            source: "v2.steps",
+            initialBaseline: Math.ceil(sum - tokens)
+          });
         }
         const text = stepTextBuffers.get(stepKey(sessionID, messageID2)) ?? "";
         stepTextBuffers.delete(stepKey(sessionID, messageID2));
@@ -2788,7 +2894,7 @@ async function setupV2(context) {
           return;
         const tokens = tokensFromRecord(data.tokens);
         if (typeof tokens === "number")
-          await accountUsage(sessionID, tokens);
+          await accountUsage(sessionID, tokens, { cumulative: true, source: "v2.session" });
         return;
       }
     }

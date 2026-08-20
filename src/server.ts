@@ -247,9 +247,11 @@ function outputTokensFromMessage(message: { info?: unknown; parts?: unknown[] })
   return undefined
 }
 
-function tokensFromMessages(messages: { info?: unknown; parts?: unknown[] }[]) {
+function usageFromMessages(messages: { info?: unknown; parts?: unknown[] }[]) {
   const exactTotal = messages.reduce<number>((sum, message) => sum + (exactTokensFromMessage(message) ?? 0), 0)
-  return exactTotal > 0 ? exactTotal : estimateMessages(messages)
+  return exactTotal > 0
+    ? { tokens: exactTotal, source: "v1.messages.exact" }
+    : { tokens: estimateMessages(messages), source: "v1.messages.estimated" }
 }
 
 function taskHeader(output: string) {
@@ -767,6 +769,7 @@ type ToolExecContext = {
 type GoalServices = {
   options: Options
   isPlanAgent: (agent: unknown) => boolean
+  initializeUsage?: (sessionID: string) => Promise<void>
 }
 
 async function createGoalFromTool(input: CreateGoalArgs, context: ToolExecContext, services: GoalServices) {
@@ -780,6 +783,7 @@ async function createGoalFromTool(input: CreateGoalArgs, context: ToolExecContex
     agent: typeof context.agent === "string" ? context.agent : null,
     initialStatus: planningOnly ? "paused" : "active",
   })
+  await services.initializeUsage?.(context.sessionID)
   return JSON.stringify(planningOnly ? { goal, plan_mode_notice: PLAN_MODE_CREATE_NOTICE } : { goal }, null, 2)
 }
 
@@ -1348,7 +1352,8 @@ const server: Plugin = async ({ client }, options?: Options) => {
           ? input.sessionID
           : output.messages.find((message) => typeof message.info.sessionID === "string")?.info.sessionID
       if (!sessionID) return
-      await accountUsage(sessionID, tokensFromMessages(output.messages))
+      const usage = usageFromMessages(output.messages)
+      await accountUsage(sessionID, usage.tokens, { cumulative: true, source: usage.source })
       const observed = await recordAssistantMessage(sessionID, latestAssistantMessage(output.messages), options ?? {})
       await reconcileLocalMarkerAfterProgress(locallyDeliveredPendingSessions, sessionID, observed.goal)
       const scheduled = scheduledContinuations.get(sessionID)
@@ -1511,11 +1516,21 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   const toolAttempts = new Map<string, string | null>()
   const planAgents = restrictedAgentSet(options)
   const isPlanAgent = (agent: unknown) => typeof agent === "string" && planAgents.has(agent.trim().toLowerCase())
-  const goalServices: GoalServices = { options, isPlanAgent }
   const activeContinuationsV2 = new Set<string>()
   const latestStepBySession = new Map<string, V2StepRecord>()
   const stepTextBuffers = new Map<string, string>()
   const stepTokenSums = new Map<string, number>()
+  const goalServices: GoalServices = {
+    options,
+    isPlanAgent,
+    initializeUsage: async (sessionID) => {
+      try {
+        await accountUsage(sessionID, stepTokenSums.get(sessionID) ?? 0, { cumulative: true, source: "v2.steps" })
+      } catch (error) {
+        v2ErrorLog("Failed to initialize goal usage accounting", error)
+      }
+    },
+  }
   const registrations: Array<{ dispose(): Promise<void> }> = []
   let disposed = false
 
@@ -1940,7 +1955,11 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
         if (typeof tokens === "number") {
           const sum = (stepTokenSums.get(sessionID) ?? 0) + tokens
           stepTokenSums.set(sessionID, sum)
-          await accountUsage(sessionID, sum)
+          await accountUsage(sessionID, sum, {
+            cumulative: true,
+            source: "v2.steps",
+            initialBaseline: Math.ceil(sum - tokens),
+          })
         }
         const text = stepTextBuffers.get(stepKey(sessionID, messageID)) ?? ""
         stepTextBuffers.delete(stepKey(sessionID, messageID))
@@ -1976,7 +1995,11 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
         if (typeof tokens === "number") {
           const sum = (stepTokenSums.get(sessionID) ?? 0) + tokens
           stepTokenSums.set(sessionID, sum)
-          await accountUsage(sessionID, sum)
+          await accountUsage(sessionID, sum, {
+            cumulative: true,
+            source: "v2.steps",
+            initialBaseline: Math.ceil(sum - tokens),
+          })
         }
         const text = stepTextBuffers.get(stepKey(sessionID, messageID)) ?? ""
         stepTextBuffers.delete(stepKey(sessionID, messageID))
@@ -2006,7 +2029,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       case "session.usage.updated": {
         if (!sessionID) return
         const tokens = tokensFromRecord(data.tokens)
-        if (typeof tokens === "number") await accountUsage(sessionID, tokens)
+        if (typeof tokens === "number") await accountUsage(sessionID, tokens, { cumulative: true, source: "v2.session" })
         return
       }
     }
