@@ -82,6 +82,7 @@ export type Goal = {
   status: GoalStatus
   tokenBudget: number | null
   tokensUsed: number
+  usageTrackers: Record<string, UsageTracker>
   timeUsedSeconds: number
   createdAt: number
   updatedAt: number
@@ -110,6 +111,14 @@ export type Goal = {
   awaitingContinuationProgress: boolean
   continuationBaselineMessageID: string
   continuationBaselineSummary: string
+}
+
+type UsageTracker = {
+  baseline: number
+  lastObserved: number
+  baseTokens: number
+  pendingBaseline: number | null
+  pendingBaseTokens: number | null
 }
 
 type State = {
@@ -169,12 +178,20 @@ const PendingAttemptSchema = Schema.Struct({
   armNoProgress: Schema.Boolean,
   previousLastContinuationAt: Schema.NullOr(Schema.Number),
 })
+const UsageTrackerSchema = Schema.Struct({
+  baseline: Schema.optionalWith(Schema.Unknown, { default: () => null }),
+  lastObserved: Schema.optionalWith(Schema.Unknown, { default: () => null }),
+  baseTokens: Schema.optionalWith(Schema.Unknown, { default: () => null }),
+  pendingBaseline: Schema.optionalWith(Schema.Unknown, { default: () => null }),
+  pendingBaseTokens: Schema.optionalWith(Schema.Unknown, { default: () => null }),
+})
 const GoalSchema = Schema.Struct({
   sessionID: Schema.String,
   objective: Schema.String,
   status: Schema.Literal("active", "paused", "budgetLimited", "usageLimited", "complete", "unmet"),
   tokenBudget: NullableNumber,
   tokensUsed: Schema.Number,
+  usageTrackers: Schema.optionalWith(Schema.Record({ key: Schema.String, value: UsageTrackerSchema }), { default: () => ({}) }),
   timeUsedSeconds: Schema.Number,
   createdAt: Schema.Number,
   updatedAt: Schema.Number,
@@ -214,7 +231,7 @@ const StateSchema = Schema.Struct({
 // getGoalInternal / the internal snapshot type instead.
 export type GoalSnapshot = Omit<
   Goal,
-  "lastAccountedAt" | "autoTurns" | "lastContinuationAt" | "pendingAttempt"
+  "lastAccountedAt" | "autoTurns" | "lastContinuationAt" | "pendingAttempt" | "usageTrackers"
 > & {
   remainingTokens: number | null
   sampledAt: number
@@ -405,11 +422,34 @@ function normalizeGoal(goal: Goal) {
   goal.maxAutoTurns = positiveIntegerOrNull(goal.maxAutoTurns)
   goal.maxDurationSeconds = positiveIntegerOrNull(goal.maxDurationSeconds)
   goal.tokenBudget = positiveIntegerOrNull(goal.tokenBudget)
+  goal.usageTrackers = normalizeUsageTrackers(goal.usageTrackers)
   goal.noProgressTokenThreshold = positiveIntegerOrNull(goal.noProgressTokenThreshold) ?? DEFAULT_NO_PROGRESS_TOKEN_THRESHOLD
   goal.maxNoProgressTurns = positiveIntegerOrNull(goal.maxNoProgressTurns) ?? DEFAULT_MAX_NO_PROGRESS_TURNS
   goal.budgetWrapupSent = goal.budgetWrapupSent === true
   goal.stopReason ??= null
   return goal
+}
+
+function normalizeUsageTrackers(trackers: Record<string, UsageTracker> | undefined) {
+  const normalized: Record<string, UsageTracker> = {}
+  for (const [source, rawTracker] of Object.entries(trackers ?? {})) {
+    const tracker = rawTracker as Partial<UsageTracker>
+    const baseline = nonNegativeIntegerOrNull(tracker?.baseline)
+    const lastObserved = nonNegativeIntegerOrNull(tracker?.lastObserved)
+    const baseTokens = nonNegativeIntegerOrNull(tracker?.baseTokens)
+    if (source && baseline != null && lastObserved != null && baseTokens != null && lastObserved >= baseline) {
+      const pendingBaseline = nonNegativeIntegerOrNull(tracker.pendingBaseline)
+      const pendingBaseTokens = nonNegativeIntegerOrNull(tracker.pendingBaseTokens)
+      normalized[source] = {
+        baseline,
+        lastObserved,
+        baseTokens,
+        pendingBaseline,
+        pendingBaseTokens: pendingBaseline == null ? null : pendingBaseTokens,
+      }
+    }
+  }
+  return normalized
 }
 
 function normalizePendingAttempt(attempt: PendingAttempt | null | undefined): PendingAttempt | null {
@@ -462,6 +502,10 @@ function positiveIntegerOrNull(value: unknown) {
 
 function nonNegativeInteger(value: unknown, fallback: number) {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : fallback
+}
+
+function nonNegativeIntegerOrNull(value: unknown) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null
 }
 
 function isClosed(status: GoalStatus) {
@@ -557,6 +601,7 @@ export async function createGoal(sessionID: string, objective: string, options?:
       status: normalizedOptions.initialStatus,
       tokenBudget: normalizedOptions.tokenBudget,
       tokensUsed: 0,
+      usageTrackers: {},
       timeUsedSeconds: 0,
       createdAt: now,
       updatedAt: now,
@@ -736,13 +781,74 @@ export async function clearGoal(sessionID: string) {
   })
 }
 
-export async function accountUsage(sessionID: string, tokensUsed?: number) {
+export async function accountUsage(
+  sessionID: string,
+  tokensUsed?: number,
+  options?: { cumulative?: boolean; source?: string; initialBaseline?: number },
+) {
   return mutate((state) => {
     const goal = state.goals[sessionID]
     if (!goal) return null
     accountWallClock(goal)
     if (typeof tokensUsed === "number" && Number.isFinite(tokensUsed)) {
-      goal.tokensUsed = Math.max(goal.tokensUsed, Math.max(0, Math.ceil(tokensUsed)))
+      const observed = Math.max(0, Math.ceil(tokensUsed))
+      if (options?.cumulative === true) {
+        const source = options.source?.trim() || "default"
+        let tracker = goal.usageTrackers[source]
+        if (!tracker) {
+          const initialBaseline = nonNegativeIntegerOrNull(options.initialBaseline)
+          tracker =
+            initialBaseline != null && initialBaseline <= observed
+              ? {
+                  baseline: initialBaseline,
+                  lastObserved: observed,
+                  baseTokens: goal.tokensUsed,
+                  pendingBaseline: null,
+                  pendingBaseTokens: null,
+                }
+              : {
+                  baseline: observed,
+                  lastObserved: observed,
+                  baseTokens: goal.tokensUsed,
+                  pendingBaseline: null,
+                  pendingBaseTokens: null,
+                }
+          goal.usageTrackers[source] = tracker
+        } else if (observed < tracker.lastObserved) {
+          const initialBaseline = nonNegativeIntegerOrNull(options.initialBaseline)
+          if (initialBaseline != null && initialBaseline <= observed) {
+            tracker = {
+              baseline: initialBaseline,
+              lastObserved: observed,
+              baseTokens: goal.tokensUsed,
+              pendingBaseline: null,
+              pendingBaseTokens: null,
+            }
+            goal.usageTrackers[source] = tracker
+          } else if (tracker.pendingBaseline == null || observed < tracker.pendingBaseline) {
+            // Require a second consistent low observation before treating an
+            // un-signaled decrease as compaction rather than a partial sample.
+            tracker.pendingBaseline = observed
+            tracker.pendingBaseTokens = goal.tokensUsed
+          } else {
+            tracker = {
+              baseline: tracker.pendingBaseline,
+              lastObserved: observed,
+              baseTokens: tracker.pendingBaseTokens ?? goal.tokensUsed,
+              pendingBaseline: null,
+              pendingBaseTokens: null,
+            }
+            goal.usageTrackers[source] = tracker
+          }
+        } else {
+          tracker.lastObserved = observed
+          tracker.pendingBaseline = null
+          tracker.pendingBaseTokens = null
+        }
+        goal.tokensUsed = Math.max(goal.tokensUsed, tracker.baseTokens + observed - tracker.baseline)
+      } else {
+        goal.tokensUsed = Math.max(goal.tokensUsed, observed)
+      }
     }
     maybeStopForBudget(goal)
     goal.updatedAt = nowSeconds()

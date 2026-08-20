@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test"
-import { mkdtemp, rm, writeFile } from "node:fs/promises"
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import plugin from "../src/server"
@@ -342,17 +342,99 @@ test("V2 events account usage and checkpoints from step/usage events", async () 
   expect(contentOf(readAfterStep)).toContain('"tokensUsed": 70')
   expect(contentOf(readAfterStep)).toContain("IMPLEMENTED_THE_FEATURE")
 
-  // Cumulative usage.updated is authoritative and raises the accounted total.
+  // The first cumulative observation establishes a baseline without counting
+  // the session's pre-goal usage or replacing step-derived goal usage.
   mock.stream.push({
     type: "session.usage.updated",
     created: Date.now(),
     data: { sessionID: "ses_v2", tokens: { input: 200, output: 50, reasoning: 0, cache: { read: 10, write: 0 } } },
   })
-  await waitFor(async () => contentOf(await goalTool(mock, "get_goal").execute({}, toolContext())).includes('"tokensUsed": 260'))
+  await waitFor(async () => {
+    const state = JSON.parse(await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8")) as {
+      goals: Record<string, { usageTrackers?: Record<string, unknown> }>
+    }
+    return JSON.stringify(state.goals.ses_v2?.usageTrackers?.["v2.session"]) ===
+      JSON.stringify({ baseline: 260, lastObserved: 260, baseTokens: 70, pendingBaseline: null, pendingBaseTokens: null })
+  })
+
+  mock.stream.push({
+    type: "session.usage.updated",
+    created: Date.now(),
+    data: { sessionID: "ses_v2", tokens: { input: 215, output: 50, reasoning: 0, cache: { read: 10, write: 0 } } },
+  })
+  await waitFor(async () => contentOf(await goalTool(mock, "get_goal").execute({}, toolContext())).includes('"tokensUsed": 85'))
 
   const read = await goalTool(mock, "get_goal").execute({}, toolContext())
-  expect(contentOf(read)).toContain('"tokensUsed": 260')
+  expect(contentOf(read)).toContain('"tokensUsed": 85')
   expect(contentOf(read)).toContain("IMPLEMENTED_THE_FEATURE")
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 step accounting excludes steps observed before goal creation", async () => {
+  const mock = makeMockContext({ auto_continue: false })
+  const cleanup = await plugin.setup(mock as never)
+
+  mock.stream.push({
+    type: "session.step.ended",
+    created: 1,
+    data: {
+      sessionID: "ses_v2",
+      assistantMessageID: "msg_before_goal",
+      tokens: { input: 50_000, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    },
+  })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  await goalTool(mock, "create_goal").execute(
+    { objective: "measure only goal work", token_budget: 1_000 },
+    toolContext(),
+  )
+
+  mock.stream.push({
+    type: "session.step.ended",
+    created: 2,
+    data: {
+      sessionID: "ses_v2",
+      assistantMessageID: "msg_goal_work",
+      tokens: { input: 200, output: 100, reasoning: 0, cache: { read: 0, write: 0 } },
+    },
+  })
+
+  await waitFor(async () => (await getGoal("ses_v2"))?.tokensUsed === 300)
+  expect(await getGoal("ses_v2")).toMatchObject({ status: "active", tokensUsed: 300 })
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 step and session sources do not double-count when session usage arrives first", async () => {
+  const mock = makeMockContext({ auto_continue: false })
+  const cleanup = await plugin.setup(mock as never)
+  await createGoalViaV2Tool(mock, "reconcile usage sources")
+
+  mock.stream.push({
+    type: "session.usage.updated",
+    created: 1,
+    data: { sessionID: "ses_v2", tokens: { input: 500_000, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } },
+  })
+  mock.stream.push({
+    type: "session.usage.updated",
+    created: 2,
+    data: { sessionID: "ses_v2", tokens: { input: 500_250, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } },
+  })
+  mock.stream.push({
+    type: "session.step.ended",
+    created: 3,
+    data: {
+      sessionID: "ses_v2",
+      assistantMessageID: "msg_goal_work",
+      tokens: { input: 200, output: 100, reasoning: 0, cache: { read: 0, write: 0 } },
+    },
+  })
+
+  await waitFor(async () => (await getGoal("ses_v2"))?.tokensUsed === 300)
+  expect((await getGoal("ses_v2"))?.tokensUsed).toBe(300)
 
   mock.stream.end()
   await cleanup()
@@ -574,6 +656,19 @@ test("V2 successful tool progress cancels no-pending transport recovery", async 
   const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0 })
   const cleanup = await plugin.setup(mock as never)
   await createGoalViaV2Tool(mock, "cancel recovery via tool progress")
+
+  mock.stream.push({
+    type: "session.usage.updated",
+    created: 0,
+    data: { sessionID: "ses_v2", tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } },
+  })
+  await waitFor(async () => {
+    const state = JSON.parse(await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8")) as {
+      goals: Record<string, { usageTrackers?: Record<string, unknown> }>
+    }
+    return JSON.stringify(state.goals.ses_v2?.usageTrackers?.["v2.session"]) ===
+      JSON.stringify({ baseline: 0, lastObserved: 0, baseTokens: 0, pendingBaseline: null, pendingBaseTokens: null })
+  })
 
   mock.stream.push({
     type: "session.error",

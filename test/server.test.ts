@@ -222,7 +222,7 @@ OpenCode goal mode policy:
     )
     const read = await requireTool(tools.get_goal, "get_goal").execute({}, context)
     expect(String(read)).toContain('"objective": "OBJECTIVE_SHOULD_NOT_LEAK_7f31"')
-    expect(String(read)).toContain('"tokensUsed": 460')
+    expect(String(read)).toContain('"tokensUsed": 0')
     expect(String(read)).toContain('"timeUsedSeconds": 5')
     expect(String(read)).toContain("CHECKPOINT_SHOULD_NOT_LEAK_4b72")
     await transform("ses_lifecycle")
@@ -274,6 +274,17 @@ OpenCode goal mode policy:
           {
             info: { id: "msg_budget", role: "assistant", sessionID: "ses_budget" },
             parts: [{ type: "step-finish", tokens: { input: 6, output: 5 } }],
+          },
+        ],
+      } as never,
+    )
+    await hooks["experimental.chat.messages.transform"]!(
+      {},
+      {
+        messages: [
+          {
+            info: { id: "msg_budget_2", role: "assistant", sessionID: "ses_budget" },
+            parts: [{ type: "step-finish", tokens: { input: 17, output: 5 } }],
           },
         ],
       } as never,
@@ -484,6 +495,12 @@ test("message transform prefers exact step token usage", async () => {
   const context = { sessionID: "ses_1" } as never
   await requireTool(tools.create_goal, "create_goal").execute({ objective: "finish" }, context)
   await hooks["experimental.chat.messages.transform"]!(
+    { sessionID: "ses_1" } as never,
+    {
+      messages: [{ info: { sessionID: "ses_1" }, parts: [{ type: "step-finish", tokens: { input: 1, output: 0 } }] }],
+    } as never,
+  )
+  await hooks["experimental.chat.messages.transform"]!(
     {},
     {
       messages: [
@@ -492,7 +509,7 @@ test("message transform prefers exact step token usage", async () => {
           parts: [
             {
               type: "step-finish",
-              tokens: { input: 10, output: 5, reasoning: 2, cache: { read: 3, write: 4 } },
+              tokens: { input: 11, output: 5, reasoning: 2, cache: { read: 3, write: 4 } },
             },
           ],
         },
@@ -502,6 +519,40 @@ test("message transform prefers exact step token usage", async () => {
   const read = await requireTool(tools.get_goal, "get_goal").execute({}, context)
 
   expect(String(read)).toContain('"tokensUsed": 24')
+})
+
+test("message transform excludes session usage observed before goal work", async () => {
+  const hooks = await plugin.server(
+    { client: { session: { promptAsync: async () => {} } } } as never,
+    { auto_continue: false },
+  )
+  const tools = hooks.tool!
+  const context = { sessionID: "ses_1" } as never
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "finish", token_budget: 10 }, context)
+
+  const transform = (total: number) =>
+    hooks["experimental.chat.messages.transform"]!(
+      {},
+      {
+        messages: [
+          {
+            info: { sessionID: "ses_1" },
+            parts: [{ type: "step-finish", tokens: { input: total, output: 0 } }],
+          },
+        ],
+      } as never,
+    )
+
+  await transform(1_000)
+  expect(await getGoal("ses_1")).toMatchObject({ status: "active", tokensUsed: 0 })
+  await hooks["experimental.chat.messages.transform"]!(
+    { sessionID: "ses_1" } as never,
+    { messages: [] } as never,
+  )
+  await transform(1_005)
+  expect(await getGoal("ses_1")).toMatchObject({ status: "active", tokensUsed: 5 })
+  const read = await requireTool(tools.get_goal, "get_goal").execute({}, context)
+  expect(String(read)).not.toContain("usageTrackers")
 })
 
 test("per-prompt chat hook recovers from an empty state file", async () => {

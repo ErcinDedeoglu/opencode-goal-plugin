@@ -81,6 +81,152 @@ test("token usage marks goals budget limited", async () => {
   expect(updated?.stopReason).toContain("token budget reached")
 })
 
+test("cumulative usage establishes a private tracker and grows by its delta across state reloads", async () => {
+  await createGoal("ses_1", "measure goal usage", null)
+  await accountUsage("ses_1", 20)
+
+  const first = await accountUsage("ses_1", 100, { cumulative: true, source: "messages" })
+  expect(first?.tokensUsed).toBe(20)
+  const persistedAfterFirst = JSON.parse(await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8")) as {
+    goals: Record<string, { usageTrackers?: Record<string, unknown> }>
+  }
+  expect(persistedAfterFirst.goals.ses_1?.usageTrackers?.messages).toEqual({
+    baseline: 100,
+    lastObserved: 100,
+    baseTokens: 20,
+    pendingBaseline: null,
+    pendingBaseTokens: null,
+  })
+
+  const grown = await accountUsage("ses_1", 105, { cumulative: true, source: "messages" })
+  expect(grown?.tokensUsed).toBe(25)
+  expect((await getGoal("ses_1"))?.tokensUsed).toBe(25)
+})
+
+test("cumulative usage rebases after a session counter reset without decreasing usage", async () => {
+  await createGoal("ses_1", "survive compaction", null)
+  await accountUsage("ses_1", 100, { cumulative: true, source: "messages" })
+  await accountUsage("ses_1", 110, { cumulative: true, source: "messages" })
+  expect((await getGoal("ses_1"))?.tokensUsed).toBe(10)
+
+  const reset = await accountUsage("ses_1", 20, { cumulative: true, source: "messages" })
+  expect(reset?.tokensUsed).toBe(10)
+  const resumed = await accountUsage("ses_1", 25, { cumulative: true, source: "messages" })
+  expect(resumed?.tokensUsed).toBe(15)
+})
+
+test("a transient cumulative dip does not inflate usage when the source recovers", async () => {
+  await createGoal("ses_1", "ignore partial observations", null)
+  await accountUsage("ses_1", 100, { cumulative: true, source: "messages" })
+  await accountUsage("ses_1", 110, { cumulative: true, source: "messages" })
+
+  expect((await accountUsage("ses_1", 0, { cumulative: true, source: "messages" }))?.tokensUsed).toBe(10)
+  expect((await accountUsage("ses_1", 115, { cumulative: true, source: "messages" }))?.tokensUsed).toBe(15)
+})
+
+test("independent cumulative sources do not add overlapping usage", async () => {
+  await createGoal("ses_1", "compare usage sources", null)
+  await accountUsage("ses_1", 100, { cumulative: true, source: "messages" })
+  await accountUsage("ses_1", 110, { cumulative: true, source: "messages" })
+  await accountUsage("ses_1", 1_000, { cumulative: true, source: "events" })
+  await accountUsage("ses_1", 1_005, { cumulative: true, source: "events" })
+  expect((await getGoal("ses_1"))?.tokensUsed).toBe(15)
+
+  await accountUsage("ses_1", 115, { cumulative: true, source: "messages" })
+  expect((await getGoal("ses_1"))?.tokensUsed).toBe(15)
+})
+
+test("an explicit initial baseline counts the first cumulative observation delta", async () => {
+  await createGoal("ses_1", "count first step", null)
+
+  await accountUsage("ses_1", 1_030, {
+    cumulative: true,
+    source: "steps",
+    initialBaseline: 1_000,
+  })
+  const observed = await accountUsage("ses_1", 1_040, { cumulative: true, source: "steps", initialBaseline: 1_030 })
+
+  expect(observed?.tokensUsed).toBe(40)
+
+  const afterRestart = await accountUsage("ses_1", 20, { cumulative: true, source: "steps", initialBaseline: 0 })
+  expect(afterRestart?.tokensUsed).toBe(60)
+})
+
+test("an explicit baseline preserves usage for legacy goals without a tracker", async () => {
+  await createGoal("ses_1", "continue after upgrade", null)
+  await accountUsage("ses_1", 50)
+
+  const observed = await accountUsage("ses_1", 2, { cumulative: true, source: "steps", initialBaseline: 0 })
+
+  expect(observed?.tokensUsed).toBe(52)
+})
+
+test("old persisted goals without usage trackers default to an empty record", async () => {
+  await createGoal("ses_1", "read old state", null)
+  const persisted = JSON.parse(await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8")) as {
+    goals: Record<string, Record<string, unknown>>
+  }
+  delete persisted.goals.ses_1?.usageTrackers
+  await writeFile(process.env.OPENCODE_GOAL_STATE_PATH!, JSON.stringify(persisted), "utf8")
+
+  expect((await getGoal("ses_1"))?.tokensUsed).toBe(0)
+  await accountUsage("ses_1", 40, { cumulative: true, source: "messages" })
+  const rewritten = JSON.parse(await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8")) as {
+    goals: Record<string, { usageTrackers?: Record<string, unknown> }>
+  }
+  expect(rewritten.goals.ses_1?.usageTrackers?.messages).toEqual({
+    baseline: 40,
+    lastObserved: 40,
+    baseTokens: 0,
+    pendingBaseline: null,
+    pendingBaseTokens: null,
+  })
+})
+
+test("invalid persisted usage trackers are discarded", async () => {
+  await createGoal("ses_1", "normalize accounting state", null)
+  const persisted = JSON.parse(await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8")) as {
+    goals: Record<string, Record<string, unknown>>
+  }
+  persisted.goals.ses_1!.usageTrackers = {
+    valid: { baseline: 10, lastObserved: 20, baseTokens: 5 },
+    fractional: { baseline: 1.5, lastObserved: 20, baseTokens: 0 },
+    backwards: { baseline: 20, lastObserved: 10, baseTokens: 0 },
+    missing: { lastObserved: 20 },
+    text: { baseline: "10", lastObserved: 20, baseTokens: 0 },
+  }
+  await writeFile(process.env.OPENCODE_GOAL_STATE_PATH!, JSON.stringify(persisted), "utf8")
+
+  await accountUsage("ses_1")
+  const rewritten = JSON.parse(await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8")) as {
+    goals: Record<string, { usageTrackers?: Record<string, unknown> }>
+  }
+  expect(rewritten.goals.ses_1?.usageTrackers).toEqual({
+    valid: { baseline: 10, lastObserved: 20, baseTokens: 5, pendingBaseline: null, pendingBaseTokens: null },
+  })
+})
+
+test("usage trackers are not exposed by public or internal snapshots", async () => {
+  const created = await createGoal("ses_1", "hide accounting internals", null)
+  await accountUsage("ses_1", 100, { cumulative: true, source: "messages" })
+
+  expect("usageTrackers" in created).toBe(false)
+  expect("usageTrackers" in (await getGoal("ses_1"))!).toBe(false)
+  expect("usageTrackers" in (await getGoalInternal("ses_1"))!).toBe(false)
+})
+
+test("direct usage accounting remains the default and does not establish a tracker", async () => {
+  await createGoal("ses_1", "preserve direct accounting", null)
+  await accountUsage("ses_1", 12)
+  const unchanged = await accountUsage("ses_1", 8)
+  expect(unchanged?.tokensUsed).toBe(12)
+
+  const persisted = JSON.parse(await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8")) as {
+    goals: Record<string, { usageTrackers?: Record<string, unknown> }>
+  }
+  expect(persisted.goals.ses_1?.usageTrackers).toEqual({})
+})
+
 test("reserves continuation until max auto turns is reached", async () => {
   await createGoal("ses_1", "continue", null)
   expect(await reserveContinuation("ses_1", 1, 0)).not.toBeNull()
