@@ -4,6 +4,7 @@ import { join } from "node:path"
 import { tmpdir } from "node:os"
 import plugin from "../src/server"
 import {
+  accountUsage,
   getGoal,
   getGoalInternal,
   recordContinuationResult,
@@ -119,6 +120,93 @@ test("set goal lets the agent formulate the goal objective", async () => {
   expect(String(created)).toContain("audit the repo")
 })
 
+test("create_goal reuses the same active objective without mutating state", async () => {
+  const hooks = await plugin.server(
+    { client: { session: { promptAsync: async () => {} } } } as never,
+    { auto_continue: false },
+  )
+  const tools = hooks.tool!
+  const context = { sessionID: "ses_1" } as never
+  await requireTool(tools.create_goal, "create_goal").execute(
+    { objective: "finish safely", token_budget: 100 },
+    context,
+  )
+  const before = await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8")
+
+  const duplicate = await requireTool(tools.create_goal, "create_goal").execute(
+    { objective: "  finish safely  ", token_budget: 999 },
+    context,
+  )
+
+  expect(String(duplicate)).toContain('"goal_reused": true')
+  expect(String(duplicate)).toContain("Do not call create_goal or set_goal again")
+  expect(String(duplicate)).toContain('"tokenBudget": 100')
+  expect(await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8")).toBe(before)
+  const conflict = await requireTool(tools.create_goal, "create_goal").execute({ objective: "replace it" }, context)
+  expect(String(conflict)).toContain('"goal_conflict": true')
+  expect(String(conflict)).toContain("Do not call create_goal or set_goal again")
+  expect(await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8")).toBe(before)
+  await expect(
+    requireTool(tools.create_goal, "create_goal").execute({ objective: "   " }, context),
+  ).rejects.toThrow("must not be empty")
+  await expect(
+    requireTool(tools.create_goal, "create_goal").execute({ objective: "x".repeat(4_001) }, context),
+  ).rejects.toThrow("at most 4000 characters")
+})
+
+test("create_goal starts a fresh goal when the matching prior goal is closed", async () => {
+  const hooks = await plugin.server(
+    { client: { session: { promptAsync: async () => {} } } } as never,
+    { auto_continue: false },
+  )
+  const tools = hooks.tool!
+  const context = { sessionID: "ses_1" } as never
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "repeatable task" }, context)
+  await requireTool(tools.update_goal, "update_goal").execute(
+    { status: "complete", evidence: "first run verified" },
+    context,
+  )
+
+  const created = await requireTool(tools.create_goal, "create_goal").execute({ objective: "repeatable task" }, context)
+
+  expect(String(created)).toContain('"status": "active"')
+  expect(String(created)).not.toContain('"goal_reused"')
+  expect(String(created)).not.toContain("first run verified")
+})
+
+test("concurrent matching create_goal calls converge on one goal", async () => {
+  const hooks = await plugin.server(
+    { client: { session: { promptAsync: async () => {} } } } as never,
+    { auto_continue: false },
+  )
+  const create = requireTool(hooks.tool?.create_goal, "create_goal")
+  const context = { sessionID: "ses_1" } as never
+
+  const results = await Promise.all([
+    create.execute({ objective: "race safely" }, context),
+    create.execute({ objective: "race safely" }, context),
+  ])
+
+  expect(results.filter((result) => String(result).includes('"goal_reused": true'))).toHaveLength(1)
+  expect((await getGoal("ses_1"))?.history.filter((entry) => entry.type === "created")).toHaveLength(1)
+})
+
+test("duplicate limited goals retain the safety stop notice", async () => {
+  const hooks = await plugin.server(
+    { client: { session: { promptAsync: async () => {} } } } as never,
+    { auto_continue: false },
+  )
+  const tools = hooks.tool!
+  const context = { sessionID: "ses_1" } as never
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "bounded task", token_budget: 10 }, context)
+  await accountUsage("ses_1", 12)
+
+  const duplicate = await requireTool(tools.create_goal, "create_goal").execute({ objective: "bounded task" }, context)
+
+  expect(String(duplicate)).toContain('"status": "budgetLimited"')
+  expect(String(duplicate)).toContain("Safety limit reached")
+})
+
 test("server plugin registers goal as a desktop/web command by default", async () => {
   const hooks = await plugin.server(
     {
@@ -144,6 +232,9 @@ test("server plugin registers goal as a desktop/web command by default", async (
   expect(config.command?.goal?.template).toContain("token_budget")
   expect(config.command?.goal?.template).toContain('"history"')
   expect(config.command?.goal?.template).toContain('"edit "')
+  expect(config.command?.goal?.template).toContain("call get_goal first")
+  expect(config.command?.goal?.template).toContain("call create_goal once")
+  expect(config.command?.goal?.template).toContain("never call it again")
 })
 
 test("system transform is byte-stable across the complete goal lifecycle", async () => {
@@ -1498,6 +1589,13 @@ test("create_goal from the plan agent records a paused goal", async () => {
 
   expect(String(created)).toContain('"status": "paused"')
   expect(String(created)).toContain('"plan_mode_notice"')
+
+  const duplicate = await requireTool(tools.create_goal, "create_goal").execute(
+    { objective: "implement the feature" },
+    { sessionID: "ses_1", agent: "build" } as never,
+  )
+  expect(String(duplicate)).toContain('"goal_reused": true')
+  expect(String(duplicate)).toContain("paused for Plan mode")
 })
 
 test("plan-created goal cannot resume from plan but resumes from build", async () => {

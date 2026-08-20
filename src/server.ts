@@ -15,6 +15,7 @@ import {
   getGoalInternal,
   markGoalUnmet,
   pauseGoalForPlanMode,
+  PLAN_MODE_STOP_REASON,
   recordAssistantProgress,
   recordContinuationResult,
   recordPromptAgent,
@@ -24,6 +25,7 @@ import {
   rollbackContinuationAttempt,
   setGoalStatus,
   updateGoalObjective,
+  validateObjective,
 } from "./state"
 import { compactionContext, continuationPrompt, limitPrompt, systemReminder } from "./prompts"
 
@@ -82,6 +84,12 @@ const PLAN_MODE_CREATE_NOTICE =
   'Goal recorded while the session is in Plan mode, so execution is paused. Do not start implementation work now. Ask the user to switch to Build mode and resume the goal (for example with "/goal resume") to begin execution.'
 const LIMITED_GOAL_NOTICE =
   "Safety limit reached. Do not start or continue substantive work for this goal. Summarize useful progress, remaining work, and blockers, then wait for the user to resume or edit the goal."
+const DUPLICATE_GOAL_NOTICE =
+  "This non-closed goal already exists. Do not call create_goal or set_goal again. The existing objective and limits were preserved; repeated-call arguments were not applied. Use the returned goal state and continue only when its status permits execution."
+const CONFLICTING_GOAL_NOTICE =
+  "A different non-closed goal already exists. Do not call create_goal or set_goal again. Report the conflict instead of replacing the goal; edit, clear, complete, or mark it unmet only when explicitly requested."
+const RESTRICTED_GOAL_NOTICE =
+  "Goal execution is not allowed from the current restricted agent or while the goal is paused for Plan mode. Switch to Build mode and resume the goal before doing substantive work."
 const activeContinuations = new Set<string>()
 
 type TaskState = "running" | "completed" | "error" | "cancelled"
@@ -145,9 +153,9 @@ Use the goal tools to handle this command:
 - If the arguments start with "edit ", update the current goal objective by calling update_goal_objective with the remaining text.
 - If the arguments start with "complete " or "done ", perform a completion audit against real artifacts and command output. Call update_goal with status "complete" only if the goal is achieved, using concise evidence from the audit.
 - If the arguments start with "unmet ", "blocked ", or "blocker ", call update_goal with status "unmet" only when the goal cannot be achieved or needs external input, using the remaining arguments as the blocker.
-- Otherwise, create a new goal with create_goal. Use the full arguments as the objective. If the user includes explicit budget instructions, pass token_budget, max_auto_turns, or max_duration_seconds to create_goal rather than leaving those words in the objective.
+- Otherwise, call get_goal first. If it returns a non-closed goal with the same objective, do not create it again; continue working from the returned state. If it returns a different non-closed goal, report that conflict instead of replacing it. Only when there is no non-closed goal, call create_goal once. Use the full arguments as the objective. If the user includes explicit budget instructions, pass token_budget, max_auto_turns, or max_duration_seconds to create_goal rather than leaving those words in the objective.
 
-Create a goal only from these explicit command arguments. Do not infer a goal from unrelated session context. After create_goal succeeds, continue working toward the new goal.`
+Create a goal only from these explicit command arguments. Do not infer a goal from unrelated session context. After create_goal succeeds or returns an existing matching goal, never call it again for this command; continue working from the returned goal state.`
 }
 
 function commandNameFromOptions(options?: Options) {
@@ -774,17 +782,51 @@ type GoalServices = {
 
 async function createGoalFromTool(input: CreateGoalArgs, context: ToolExecContext, services: GoalServices) {
   const planningOnly = services.isPlanAgent(context.agent)
-  const goal = await createGoal(context.sessionID, input.objective, {
-    tokenBudget: input.token_budget ?? services.options.default_token_budget ?? null,
-    maxAutoTurns: input.max_auto_turns ?? null,
-    maxDurationSeconds: input.max_duration_seconds ?? services.options.max_goal_duration_seconds ?? null,
-    noProgressTokenThreshold: services.options.no_progress_token_threshold ?? null,
-    maxNoProgressTurns: services.options.max_no_progress_turns ?? null,
-    agent: typeof context.agent === "string" ? context.agent : null,
-    initialStatus: planningOnly ? "paused" : "active",
-  })
+  const objective = validateObjective(input.objective)
+  const existing = await getGoal(context.sessionID)
+  if (existing && !isClosedGoal(existing)) return existingGoalResult(existing, objective, planningOnly)
+
+  let goal: GoalSnapshot
+  try {
+    goal = await createGoal(context.sessionID, input.objective, {
+      tokenBudget: input.token_budget ?? services.options.default_token_budget ?? null,
+      maxAutoTurns: input.max_auto_turns ?? null,
+      maxDurationSeconds: input.max_duration_seconds ?? services.options.max_goal_duration_seconds ?? null,
+      noProgressTokenThreshold: services.options.no_progress_token_threshold ?? null,
+      maxNoProgressTurns: services.options.max_no_progress_turns ?? null,
+      agent: typeof context.agent === "string" ? context.agent : null,
+      initialStatus: planningOnly ? "paused" : "active",
+    })
+  } catch (error) {
+    if (!(error instanceof Error) || !error.message.includes("non-closed goal")) throw error
+    const raced = await getGoal(context.sessionID)
+    if (raced && !isClosedGoal(raced)) return existingGoalResult(raced, objective, planningOnly)
+    throw error
+  }
   await services.initializeUsage?.(context.sessionID)
   return JSON.stringify(planningOnly ? { goal, plan_mode_notice: PLAN_MODE_CREATE_NOTICE } : { goal }, null, 2)
+}
+
+function isClosedGoal(goal: GoalSnapshot) {
+  return goal.status === "complete" || goal.status === "unmet"
+}
+
+function existingGoalResult(goal: GoalSnapshot, requestedObjective: string, planningOnly: boolean) {
+  const reused = goal.objective === requestedObjective
+  return JSON.stringify(
+    {
+      goal,
+      ...(reused
+        ? { goal_reused: true, duplicate_goal_notice: DUPLICATE_GOAL_NOTICE }
+        : { goal_conflict: true, goal_conflict_notice: CONFLICTING_GOAL_NOTICE }),
+      ...(goal.status === "budgetLimited" || goal.status === "usageLimited"
+        ? { goal_mode_notice: LIMITED_GOAL_NOTICE }
+        : {}),
+      ...(planningOnly || goal.stopReason === PLAN_MODE_STOP_REASON ? { plan_mode_notice: RESTRICTED_GOAL_NOTICE } : {}),
+    },
+    null,
+    2,
+  )
 }
 
 async function updateGoalObjectiveFromTool(
@@ -1225,7 +1267,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
       },
       create_goal: {
         description:
-          "Create a goal only when explicitly requested by the user or system/developer instructions; do not infer goals from ordinary tasks. Fails if a non-complete goal exists. While the session is in Plan mode, the goal is recorded as paused and execution requires the user to switch to Build mode.",
+          "Create a goal only when explicitly requested by the user or system/developer instructions; do not infer goals from ordinary tasks. If any non-closed goal exists, this returns the existing goal as either reused or conflicting and must not be retried. While the session is in Plan mode, the goal is recorded as paused and execution requires the user to switch to Build mode.",
         args: {
           objective: z.string().min(1).max(4000).describe("The concrete objective to start pursuing."),
           token_budget: z.number().int().positive().nullable().optional().describe("Optional positive token budget."),
@@ -1238,7 +1280,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
       },
       set_goal: {
         description:
-          "Set a new goal when the user explicitly asks the agent to formulate and set its own goal. The model should write the objective itself based on the user's explicit request. Fails if a non-complete goal exists. While the session is in Plan mode, the goal is recorded as paused and execution requires the user to switch to Build mode.",
+          "Set a new goal when the user explicitly asks the agent to formulate and set its own goal. The model should write the objective itself based on the user's explicit request. If any non-closed goal exists, this returns the existing goal as either reused or conflicting and must not be retried. While the session is in Plan mode, the goal is recorded as paused and execution requires the user to switch to Build mode.",
         args: {
           objective: z.string().min(1).max(4000).describe("The model-formulated concrete objective to start pursuing."),
           token_budget: z.number().int().positive().nullable().optional().describe("Optional positive token budget."),
@@ -2169,7 +2211,7 @@ function goalToolsV2(services: GoalServices): ToolV2Info[] {
     {
       name: "create_goal",
       description:
-        "Create a goal only when explicitly requested by the user or system/developer instructions; do not infer goals from ordinary tasks. Fails if a non-complete goal exists. While the session is in Plan mode, the goal is recorded as paused and execution requires the user to switch to Build mode.",
+        "Create a goal only when explicitly requested by the user or system/developer instructions; do not infer goals from ordinary tasks. If any non-closed goal exists, this returns the existing goal as either reused or conflicting and must not be retried. While the session is in Plan mode, the goal is recorded as paused and execution requires the user to switch to Build mode.",
       input: v2ObjectSchema(
         {
           objective: { type: "string", minLength: 1, maxLength: 4000, description: "The concrete objective to start pursuing." },
@@ -2187,7 +2229,7 @@ function goalToolsV2(services: GoalServices): ToolV2Info[] {
     {
       name: "set_goal",
       description:
-        "Set a new goal when the user explicitly asks the agent to formulate and set its own goal. The model should write the objective itself based on the user's explicit request. Fails if a non-complete goal exists. While the session is in Plan mode, the goal is recorded as paused and execution requires the user to switch to Build mode.",
+        "Set a new goal when the user explicitly asks the agent to formulate and set its own goal. The model should write the objective itself based on the user's explicit request. If any non-closed goal exists, this returns the existing goal as either reused or conflicting and must not be retried. While the session is in Plan mode, the goal is recorded as paused and execution requires the user to switch to Build mode.",
       input: v2ObjectSchema(
         {
           objective: {
