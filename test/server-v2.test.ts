@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test"
-import { mkdtemp, rm } from "node:fs/promises"
+import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import plugin from "../src/server"
@@ -225,6 +225,19 @@ test("V2 setup registers goal tools with JSON Schema inputs, codemode:false, and
   mock.stream.end()
   await cleanup()
   expect(mock.promptCalls).toHaveLength(0)
+})
+
+test("V2 create_goal recovers from a zero-filled state file", async () => {
+  await writeFile(process.env.OPENCODE_GOAL_STATE_PATH!, "\u0000\u0000", "utf8")
+  const mock = makeMockContext({ auto_continue: false })
+  const cleanup = await plugin.setup(mock as never)
+
+  const created = await createGoalViaV2Tool(mock, "recover V2 state")
+
+  expect(contentOf(created)).toContain('"objective": "recover V2 state"')
+  expect((await getGoal("ses_v2"))?.objective).toBe("recover V2 state")
+  mock.stream.end()
+  await cleanup()
 })
 
 test("V2 setup registers the /goal command via command transform", async () => {

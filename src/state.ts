@@ -254,6 +254,29 @@ function mutableState(state: Schema.Schema.Type<typeof StateSchema>): State {
   return JSON.parse(JSON.stringify(state)) as State
 }
 
+const warnedEmptyStatePaths = new Set<string>()
+
+function isStatePadding(character: string) {
+  return character === "\0" || character.trim() === ""
+}
+
+function parseStateText(raw: string, file: string): unknown {
+  // trim handles whitespace and UTF-8 BOMs. NUL padding can remain after an
+  // interrupted filesystem write, so tolerate it only at the file boundaries.
+  let start = 0
+  let end = raw.length
+  while (start < end && isStatePadding(raw[start]!)) start += 1
+  while (end > start && isStatePadding(raw[end - 1]!)) end -= 1
+  const content = raw.slice(start, end)
+  if (content) return JSON.parse(content) as unknown
+
+  if (!warnedEmptyStatePaths.has(file)) {
+    warnedEmptyStatePaths.add(file)
+    console.warn(`[opencode-goal-plugin] Empty or zero-filled state file at ${file}; recovering with empty state.`)
+  }
+  return emptyState()
+}
+
 function decodeState(value: unknown) {
   return Schema.decodeUnknown(StateSchema)(value).pipe(
     Effect.map(mutableState),
@@ -263,13 +286,14 @@ function decodeState(value: unknown) {
 }
 
 function readStateEffect() {
+  const file = statePath()
   return Effect.tryPromise({
-    try: () => readFile(statePath(), "utf8"),
+    try: () => readFile(file, "utf8"),
     catch: (cause) => new StateReadError({ cause }),
   }).pipe(
     Effect.flatMap((raw) =>
       Effect.try({
-        try: () => JSON.parse(raw) as unknown,
+        try: () => parseStateText(raw, file),
         catch: (cause) => new StateDecodeError({ cause }),
       }),
     ),
@@ -307,8 +331,9 @@ async function readState(): Promise<State> {
 
 function readStateSync(): State {
   try {
-    const raw = readFileSync(statePath(), "utf8")
-    return normalizeState(mutableState(Schema.decodeUnknownSync(StateSchema)(JSON.parse(raw) as unknown)))
+    const file = statePath()
+    const raw = readFileSync(file, "utf8")
+    return normalizeState(mutableState(Schema.decodeUnknownSync(StateSchema)(parseStateText(raw, file))))
   } catch (error) {
     if (isMissingStateFile(error)) return emptyState()
     throw error

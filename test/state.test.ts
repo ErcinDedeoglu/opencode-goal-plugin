@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test"
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test"
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
@@ -11,6 +11,7 @@ import {
   recordAssistantProgress,
   getGoal,
   getGoalInternal,
+  getGoalSync,
   markGoalUnmet,
   pauseGoalForPlanMode,
   recordContinuationResult,
@@ -286,9 +287,65 @@ test("writes state with owner-only file permissions", async () => {
 test("does not overwrite corrupt persisted state", async () => {
   await writeFile(process.env.OPENCODE_GOAL_STATE_PATH!, "{not valid json", "utf8")
 
+  expect(() => getGoalSync("ses_1")).toThrow()
   await expect(createGoal("ses_1", "ship the plugin", null)).rejects.toThrow()
 
   expect(await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8")).toBe("{not valid json")
+})
+
+test("treats empty and zero-filled state files as missing for async and sync reads", async () => {
+  for (const content of ["", " \n\t", "\uFEFF", "\u0000\u0000"]) {
+    await writeFile(process.env.OPENCODE_GOAL_STATE_PATH!, content, "utf8")
+
+    expect(await getGoal("ses_1")).toBeNull()
+    expect(getGoalSync("ses_1")).toBeNull()
+    expect(await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8")).toBe(content)
+  }
+})
+
+test("loads valid state prefixed by a UTF-8 BOM", async () => {
+  const content = `\uFEFF${JSON.stringify({ version: 1, goals: {} })}`
+  await writeFile(process.env.OPENCODE_GOAL_STATE_PATH!, content, "utf8")
+
+  expect(await getGoal("ses_1")).toBeNull()
+  expect(getGoalSync("ses_1")).toBeNull()
+  expect(await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8")).toBe(content)
+})
+
+test("creates and persists a goal from an empty state file", async () => {
+  await writeFile(process.env.OPENCODE_GOAL_STATE_PATH!, "", "utf8")
+
+  const created = await createGoal("ses_1", "recover safely", null)
+
+  expect(created.objective).toBe("recover safely")
+  expect((await getGoal("ses_1"))?.objective).toBe("recover safely")
+  expect(JSON.parse(await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8"))).toMatchObject({
+    version: 1,
+    goals: { ses_1: { objective: "recover safely" } },
+  })
+})
+
+test("warns once for each empty state file path", async () => {
+  const first = process.env.OPENCODE_GOAL_STATE_PATH!
+  const second = join(dir, "other-goals.json")
+  await writeFile(first, "", "utf8")
+  await writeFile(second, "", "utf8")
+  const warnings: string[] = []
+  const warn = spyOn(console, "warn").mockImplementation((message) => {
+    warnings.push(String(message))
+  })
+
+  try {
+    expect(await getGoal("ses_1")).toBeNull()
+    expect(getGoalSync("ses_1")).toBeNull()
+    process.env.OPENCODE_GOAL_STATE_PATH = second
+    expect(await getGoal("ses_1")).toBeNull()
+  } finally {
+    warn.mockRestore()
+  }
+
+  expect(warnings.filter((message) => message.includes(first))).toHaveLength(1)
+  expect(warnings.filter((message) => message.includes(second))).toHaveLength(1)
 })
 
 test("prompt delivery arms the pending window but never resets the failure count", async () => {

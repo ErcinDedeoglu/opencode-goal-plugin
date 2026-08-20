@@ -504,6 +504,24 @@ test("message transform prefers exact step token usage", async () => {
   expect(String(read)).toContain('"tokensUsed": 24')
 })
 
+test("per-prompt chat hook recovers from an empty state file", async () => {
+  await writeFile(process.env.OPENCODE_GOAL_STATE_PATH!, "", "utf8")
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async () => {},
+        },
+      },
+    } as never,
+    { auto_continue: false },
+  )
+
+  await hooks["chat.message"]!({ sessionID: "ses_1", agent: "build" } as never, { message: {} } as never)
+
+  expect(JSON.parse(await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8"))).toEqual({ version: 1, goals: {} })
+})
+
 test("message transform records assistant checkpoints", async () => {
   const hooks = await plugin.server(
     {
