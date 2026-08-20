@@ -240,6 +240,33 @@ test("V2 create_goal recovers from a zero-filled state file", async () => {
   await cleanup()
 })
 
+test("V2 create_goal reuses the same active objective without reinitializing state", async () => {
+  const mock = makeMockContext({ auto_continue: false })
+  const cleanup = await plugin.setup(mock as never)
+  await goalTool(mock, "create_goal").execute(
+    { objective: "finish V2 safely", token_budget: 100 },
+    toolContext(),
+  )
+  const before = await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8")
+
+  const duplicate = await goalTool(mock, "set_goal").execute(
+    { objective: " finish V2 safely ", token_budget: 999 },
+    toolContext(),
+  )
+
+  expect(contentOf(duplicate)).toContain('"goal_reused": true')
+  expect(contentOf(duplicate)).toContain("Do not call create_goal or set_goal again")
+  expect(contentOf(duplicate)).toContain('"tokenBudget": 100')
+  expect(await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8")).toBe(before)
+  const conflict = await goalTool(mock, "create_goal").execute({ objective: "replace V2 goal" }, toolContext())
+  expect(contentOf(conflict)).toContain('"goal_conflict": true')
+  expect(contentOf(conflict)).toContain("Do not call create_goal or set_goal again")
+  expect(await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8")).toBe(before)
+
+  mock.stream.end()
+  await cleanup()
+})
+
 test("V2 setup registers the /goal command via command transform", async () => {
   const mock = makeMockContext({ auto_continue: false })
   const cleanup = await plugin.setup(mock as never)
@@ -248,6 +275,8 @@ test("V2 setup registers the /goal command via command transform", async () => {
   expect(command).toBeDefined()
   expect(command?.template).toContain('OpenCode goal mode command "/goal" was invoked')
   expect(command?.template).toContain("$ARGUMENTS")
+  expect(command?.template).toContain("call get_goal first")
+  expect(command?.template).toContain("never call it again")
 
   mock.stream.end()
   await cleanup()
