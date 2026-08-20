@@ -140,6 +140,7 @@ class StateWriteError extends Data.TaggedError("StateWriteError")<{
 
 const MAX_HISTORY_ENTRIES = 50
 const MAX_CHECKPOINTS = 8
+const MAX_LISTED_GOALS = 50
 const CHECKPOINT_CHAR_LIMIT = 280
 const DEFAULT_NO_PROGRESS_TOKEN_THRESHOLD = 50
 const DEFAULT_MAX_NO_PROGRESS_TURNS = 2
@@ -243,6 +244,23 @@ export type GoalSnapshot = Omit<
 export type InternalGoalSnapshot = GoalSnapshot & {
   pendingAttempt: PendingAttempt | null
 }
+
+export type GoalListItem = Pick<
+  Goal,
+  | "sessionID"
+  | "objective"
+  | "status"
+  | "tokenBudget"
+  | "tokensUsed"
+  | "timeUsedSeconds"
+  | "createdAt"
+  | "updatedAt"
+  | "closedAt"
+  | "maxAutoTurns"
+  | "maxDurationSeconds"
+  | "autoTurns"
+  | "stopReason"
+> & { remainingTokens: number | null }
 
 function defaultStateFile() {
   const dataHome =
@@ -571,6 +589,35 @@ export async function getGoal(sessionID: string) {
   const state = await readState()
   const goal = state.goals[sessionID]
   return goal ? snapshot(goal) : null
+}
+
+export async function getAllGoals() {
+  const state = await readState()
+  const sorted = Object.values(state.goals).sort(
+    (left, right) =>
+      right.updatedAt - left.updatedAt || (left.sessionID < right.sessionID ? -1 : left.sessionID > right.sessionID ? 1 : 0),
+  )
+  const goals = sorted.slice(0, MAX_LISTED_GOALS).map(goalListItem)
+  return { goals, total: sorted.length, truncated: sorted.length > goals.length }
+}
+
+function goalListItem(goal: Goal): GoalListItem {
+  return {
+    sessionID: goal.sessionID,
+    objective: goal.objective,
+    status: goal.status,
+    tokenBudget: goal.tokenBudget,
+    tokensUsed: goal.tokensUsed,
+    timeUsedSeconds: goal.timeUsedSeconds,
+    createdAt: goal.createdAt,
+    updatedAt: goal.updatedAt,
+    closedAt: goal.closedAt ?? null,
+    maxAutoTurns: goal.maxAutoTurns,
+    maxDurationSeconds: goal.maxDurationSeconds,
+    autoTurns: goal.autoTurns,
+    stopReason: goal.stopReason,
+    remainingTokens: remainingTokens(goal),
+  }
 }
 
 export async function getGoalInternal(sessionID: string) {

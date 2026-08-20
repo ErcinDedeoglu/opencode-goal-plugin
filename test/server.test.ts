@@ -74,6 +74,7 @@ test("server plugin exposes Codex-style goal tools", async () => {
     "create_goal",
     "get_goal",
     "get_goal_history",
+    "list_all_goals",
     "set_goal",
     "update_goal",
     "update_goal_objective",
@@ -95,6 +96,32 @@ test("server plugin exposes Codex-style goal tools", async () => {
   expect(String(completed)).toContain('"completion_report"')
   expect(String(completed)).toContain('"completionEvidence": "verified locally"')
   expect(calls).toHaveLength(0)
+})
+
+test("list_all_goals returns goals from other sessions", async () => {
+  const hooks = await plugin.server(
+    { client: { session: { promptAsync: async () => {} } } } as never,
+    { auto_continue: false },
+  )
+  const tools = hooks.tool!
+  await requireTool(tools.create_goal, "create_goal").execute(
+    { objective: "first session goal" },
+    { sessionID: "ses_first" } as never,
+  )
+  await requireTool(tools.create_goal, "create_goal").execute(
+    { objective: "second session goal" },
+    { sessionID: "ses_second" } as never,
+  )
+
+  const listed = await requireTool(tools.list_all_goals, "list_all_goals").execute(
+    {},
+    { sessionID: "ses_observer" } as never,
+  )
+
+  expect(String(listed)).toContain('"sessionID": "ses_first"')
+  expect(String(listed)).toContain('"sessionID": "ses_second"')
+  expect(String(listed)).not.toContain("usageTrackers")
+  expect(String(listed)).not.toContain("pendingAttempt")
 })
 
 test("set goal lets the agent formulate the goal objective", async () => {
@@ -2768,6 +2795,11 @@ test("tool progress honors completed states and never resets on failed or incomp
   await hooks["tool.execute.after"]!(
     { tool: "get_goal", sessionID: "ses_1", callID: "call_get_goal", args: {} } as never,
     { title: "get_goal", output: '{"goal":{"status":"active"}}', metadata: {} } as never,
+  )
+  expect((await getGoal("ses_1"))?.continuationFailures).toBe(1)
+  await hooks["tool.execute.after"]!(
+    { tool: "list_all_goals", sessionID: "ses_1", callID: "call_list_all_goals", args: {} } as never,
+    { title: "list_all_goals", output: '{"goals":[]}', metadata: {} } as never,
   )
   expect((await getGoal("ses_1"))?.continuationFailures).toBe(1)
 

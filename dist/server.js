@@ -127,6 +127,7 @@ class StateWriteError extends Data.TaggedError("StateWriteError") {
 }
 var MAX_HISTORY_ENTRIES = 50;
 var MAX_CHECKPOINTS = 8;
+var MAX_LISTED_GOALS = 50;
 var CHECKPOINT_CHAR_LIMIT = 280;
 var DEFAULT_NO_PROGRESS_TOKEN_THRESHOLD = 50;
 var DEFAULT_MAX_NO_PROGRESS_TURNS = 2;
@@ -455,6 +456,30 @@ async function getGoal(sessionID) {
   const state = await readState();
   const goal = state.goals[sessionID];
   return goal ? snapshot(goal) : null;
+}
+async function getAllGoals() {
+  const state = await readState();
+  const sorted = Object.values(state.goals).sort((left, right) => right.updatedAt - left.updatedAt || (left.sessionID < right.sessionID ? -1 : left.sessionID > right.sessionID ? 1 : 0));
+  const goals = sorted.slice(0, MAX_LISTED_GOALS).map(goalListItem);
+  return { goals, total: sorted.length, truncated: sorted.length > goals.length };
+}
+function goalListItem(goal) {
+  return {
+    sessionID: goal.sessionID,
+    objective: goal.objective,
+    status: goal.status,
+    tokenBudget: goal.tokenBudget,
+    tokensUsed: goal.tokensUsed,
+    timeUsedSeconds: goal.timeUsedSeconds,
+    createdAt: goal.createdAt,
+    updatedAt: goal.updatedAt,
+    closedAt: goal.closedAt ?? null,
+    maxAutoTurns: goal.maxAutoTurns,
+    maxDurationSeconds: goal.maxDurationSeconds,
+    autoTurns: goal.autoTurns,
+    stopReason: goal.stopReason,
+    remainingTokens: remainingTokens(goal)
+  };
 }
 async function getGoalInternal(sessionID) {
   const state = await readState();
@@ -1140,7 +1165,7 @@ var STALE_PENDING_MS = 30000;
 var RETRY_SETTLE_MS = 25;
 var TRANSPORT_ERROR_PATTERN = /\b(?:network|fetch|socket|connect|connection|timeout|timed out|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|EPIPE|transport|stream|websocket|offline|internet|request failed|proxy)\b/i;
 var NON_TRANSPORT_TERMINAL_PATTERN = /\b(?:abort(?:ed)?|interrupt(?:ed|ion)?)\b/i;
-var NON_PROGRESS_TOOLS = new Set(["get_goal", "get_goal_history"]);
+var NON_PROGRESS_TOOLS = new Set(["get_goal", "get_goal_history", "list_all_goals"]);
 var TASK_TERMINAL_STATES = new Set(["completed", "error", "cancelled"]);
 var PLAN_MODE_CREATE_NOTICE = 'Goal recorded while the session is in Plan mode, so execution is paused. Do not start implementation work now. Ask the user to switch to Build mode and resume the goal (for example with "/goal resume") to begin execution.';
 var LIMITED_GOAL_NOTICE = "Safety limit reached. Do not start or continue substantive work for this goal. Summarize useful progress, remaining work, and blockers, then wait for the user to resume or edit the goal.";
@@ -2171,6 +2196,13 @@ var server = async ({ client }, options) => {
           return JSON.stringify({ goal, history_report: formatGoalHistory(goal) }, null, 2);
         }
       },
+      list_all_goals: {
+        description: "List up to 50 public goal summaries across all sessions in this state file, ordered by most recently updated first. Elapsed time is the last persisted value; total and truncated report omitted older goals.",
+        args: {},
+        async execute() {
+          return JSON.stringify(await getAllGoals(), null, 2);
+        }
+      },
       create_goal: {
         description: "Create a goal only when explicitly requested by the user or system/developer instructions; do not infer goals from ordinary tasks. If any non-closed goal exists, this returns the existing goal as either reused or conflicting and must not be retried. While the session is in Plan mode, the goal is recorded as paused and execution requires the user to switch to Build mode.",
         args: {
@@ -3045,6 +3077,15 @@ function goalToolsV2(services) {
         const goal = await getGoal(toolContext.sessionID);
         return { content: JSON.stringify({ goal, history_report: formatGoalHistory(goal) }, null, 2) };
       }
+    },
+    {
+      name: "list_all_goals",
+      description: "List up to 50 public goal summaries across all sessions in this state file, ordered by most recently updated first. Elapsed time is the last persisted value; total and truncated report omitted older goals.",
+      input: v2ObjectSchema({}),
+      options: { codemode: false },
+      execute: async () => ({
+        content: JSON.stringify(await getAllGoals(), null, 2)
+      })
     },
     {
       name: "create_goal",

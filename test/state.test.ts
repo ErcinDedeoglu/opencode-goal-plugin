@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, spyOn, test } from "bun:test"
+import { afterEach, beforeEach, expect, setSystemTime, spyOn, test } from "bun:test"
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
@@ -7,6 +7,7 @@ import {
   clearGoal,
   completeGoal,
   createGoal,
+  getAllGoals,
   markPendingContinuationStarted,
   recordAssistantProgress,
   getGoal,
@@ -52,6 +53,51 @@ test("creates, reads, pauses, resumes, completes, and clears a goal", async () =
   expect(completed.completionEvidence).toBe("tests passed")
   expect(await clearGoal("ses_1")).toBe(true)
   expect(await getGoal("ses_1")).toBeNull()
+})
+
+test("lists public goals across sessions by most recent update", async () => {
+  expect(await getAllGoals()).toEqual({ goals: [], total: 0, truncated: false })
+
+  try {
+    setSystemTime(new Date(100_000))
+    await createGoal("ses_old", "older goal", null)
+    await accountUsage("ses_old", 500, { cumulative: true, source: "private-test-source" })
+    await reserveContinuation("ses_old", 10, 0)
+
+    setSystemTime(new Date(200_000))
+    await createGoal("ses_new", "newer goal", null)
+
+    const listed = await getAllGoals()
+    expect(listed).toMatchObject({ total: 2, truncated: false })
+    expect(listed.goals.map((goal) => goal.sessionID)).toEqual(["ses_new", "ses_old"])
+    expect(listed.goals.map((goal) => goal.objective)).toEqual(["newer goal", "older goal"])
+    expect(listed.goals.find((goal) => goal.sessionID === "ses_old")?.timeUsedSeconds).toBe(0)
+    for (const goal of listed.goals) {
+      expect(goal).not.toHaveProperty("usageTrackers")
+      expect(goal).not.toHaveProperty("pendingAttempt")
+      expect(goal).not.toHaveProperty("history")
+      expect(goal).not.toHaveProperty("checkpoints")
+      expect(goal).not.toHaveProperty("lastAssistantText")
+      expect(goal).not.toHaveProperty("completionEvidence")
+      expect(goal).not.toHaveProperty("blocker")
+    }
+  } finally {
+    setSystemTime()
+  }
+})
+
+test("caps cross-session goal listings and reports truncation", async () => {
+  for (let index = 50; index >= 0; index -= 1) {
+    await createGoal(`ses_${String(index).padStart(2, "0")}`, `goal ${index}`, null)
+  }
+
+  const listed = await getAllGoals()
+
+  expect(listed.total).toBe(51)
+  expect(listed.truncated).toBe(true)
+  expect(listed.goals).toHaveLength(50)
+  expect(listed.goals[0]?.sessionID).toBe("ses_00")
+  expect(listed.goals.at(-1)?.sessionID).toBe("ses_49")
 })
 
 test("marks a goal unmet with a blocker and allows a new goal afterward", async () => {
