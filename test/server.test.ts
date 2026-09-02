@@ -5,6 +5,8 @@ import { tmpdir } from "node:os"
 import plugin from "../src/server"
 import {
   accountUsage,
+  configureMaxObjectiveChars,
+  DEFAULT_MAX_OBJECTIVE_CHARS,
   getGoal,
   getGoalInternal,
   recordContinuationResult,
@@ -57,6 +59,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
   for (const dispose of serverDisposers.splice(0).reverse()) await dispose()
+  configureMaxObjectiveChars(DEFAULT_MAX_OBJECTIVE_CHARS)
   delete process.env.OPENCODE_GOAL_STATE_PATH
   await rm(dir, { recursive: true, force: true })
 })
@@ -160,7 +163,7 @@ test("set goal lets the agent formulate the goal objective", async () => {
 test("create_goal reuses the same active objective without mutating state", async () => {
   const hooks = await setupServer(
     { client: { session: { promptAsync: async () => {} } } } as never,
-    { auto_continue: false },
+    { auto_continue: false, max_objective_chars: 4000 },
   )
   const tools = hooks.tool!
   const context = { sessionID: "ses_1" } as never
