@@ -17,7 +17,7 @@ Please report security issues privately so a fix can be released before the
 details are public:
 
 - Preferred: open a private report through
-  [GitHub Security Advisories](https://github.com/prevalentWare/opencode-goal-plugin/security/advisories/new).
+  [GitHub Security Advisories](https://github.com/ErcinDedeoglu/opencode-goal-plugin/security/advisories/new).
 - Alternatively, email desarrollo-web@prevalentware.com with a description,
   reproduction steps, and the affected version.
 

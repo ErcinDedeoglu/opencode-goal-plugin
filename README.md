@@ -1,7 +1,7 @@
 # OpenCode Goal Plugin
 
-[![npm version](https://img.shields.io/npm/v/@prevalentware/opencode-goal-plugin.svg)](https://www.npmjs.com/package/@prevalentware/opencode-goal-plugin)
-[![GitHub repository](https://img.shields.io/badge/GitHub-prevalentWare%2Fopencode--goal--plugin-blue?logo=github)](https://github.com/prevalentWare/opencode-goal-plugin)
+[![npm version](https://img.shields.io/npm/v/@ercindedeoglu/opencode-goal-plugin.svg)](https://www.npmjs.com/package/@ercindedeoglu/opencode-goal-plugin)
+[![GitHub repository](https://img.shields.io/badge/GitHub-ErcinDedeoglu%2Fopencode--goal--plugin-blue?logo=github)](https://github.com/ErcinDedeoglu/opencode-goal-plugin)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 OpenCode Goal Plugin adds Codex-style long-running goal mode to OpenCode. It gives AI coding agents a `/goal` slash command, persistent goal state, completion evidence, idle continuation, and a terminal UI goal indicator so an OpenCode session can keep working toward one explicit objective until it is complete, blocked, or cleared.
@@ -10,9 +10,9 @@ If you are searching for an OpenCode goal plugin, goal mode for OpenCode, or a w
 
 Links:
 
-- npm package: [`@prevalentware/opencode-goal-plugin`](https://www.npmjs.com/package/@prevalentware/opencode-goal-plugin)
-- GitHub repository: [`prevalentWare/opencode-goal-plugin`](https://github.com/prevalentWare/opencode-goal-plugin)
-- OpenCode plugin command: `opencode plugin @prevalentware/opencode-goal-plugin`
+- npm package: [`@ercindedeoglu/opencode-goal-plugin`](https://www.npmjs.com/package/@ercindedeoglu/opencode-goal-plugin)
+- GitHub repository: [`ErcinDedeoglu/opencode-goal-plugin`](https://github.com/ErcinDedeoglu/opencode-goal-plugin)
+- OpenCode plugin command: `opencode plugin @ercindedeoglu/opencode-goal-plugin`
 
 The OpenCode Goal Plugin adds:
 
@@ -52,13 +52,13 @@ Do not mix the configuration formats. OpenCode 1 uses `plugin` and `tui.json`; O
 Install for the current project:
 
 ```bash
-opencode plugin @prevalentware/opencode-goal-plugin
+opencode plugin @ercindedeoglu/opencode-goal-plugin
 ```
 
 Install globally:
 
 ```bash
-opencode plugin -g @prevalentware/opencode-goal-plugin
+opencode plugin -g @ercindedeoglu/opencode-goal-plugin
 ```
 
 OpenCode detects both package entrypoints and writes the plugin into the server and TUI config targets.
@@ -69,7 +69,7 @@ For manual installation, add the package to both V1 config files.
 
 ```json
 {
-  "plugin": ["@prevalentware/opencode-goal-plugin"]
+  "plugin": ["@ercindedeoglu/opencode-goal-plugin"]
 }
 ```
 
@@ -77,7 +77,7 @@ For manual installation, add the package to both V1 config files.
 
 ```json
 {
-  "plugin": ["@prevalentware/opencode-goal-plugin"]
+  "plugin": ["@ercindedeoglu/opencode-goal-plugin"]
 }
 ```
 
@@ -91,7 +91,7 @@ Add the package to both V2 plugin lists:
 
 ```json
 {
-  "plugins": ["@prevalentware/opencode-goal-plugin"]
+  "plugins": ["@ercindedeoglu/opencode-goal-plugin"]
 }
 ```
 
@@ -99,7 +99,7 @@ Add the package to both V2 plugin lists:
 
 ```json
 {
-  "plugins": ["@prevalentware/opencode-goal-plugin"]
+  "plugins": ["@ercindedeoglu/opencode-goal-plugin"]
 }
 ```
 
@@ -115,7 +115,7 @@ In OpenCode 1, server options use the package-and-options tuple in `opencode.jso
 {
   "plugin": [
     [
-      "@prevalentware/opencode-goal-plugin",
+      "@ercindedeoglu/opencode-goal-plugin",
       {
         "auto_continue": true,
         "defer_while_tasks_active": true,
@@ -142,7 +142,7 @@ In OpenCode 2, use the plugin object form instead:
 {
   "plugins": [
     {
-      "package": "@prevalentware/opencode-goal-plugin",
+      "package": "@ercindedeoglu/opencode-goal-plugin",
       "options": {
         "auto_continue": true,
         "max_auto_turns": 25,
@@ -256,7 +256,7 @@ Before the first automated publish, configure the package on npm:
 
 1. Open the package settings on npmjs.com.
 2. Add a Trusted Publisher for GitHub Actions.
-3. Use repository `prevalentWare/opencode-goal-plugin`.
+3. Use repository `ErcinDedeoglu/opencode-goal-plugin`.
 4. Use workflow file `publish.yml`.
 
 The repository must be public for npm provenance to be generated automatically.
