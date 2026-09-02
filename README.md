@@ -128,7 +128,8 @@ In OpenCode 1, server options use the package-and-options tuple in `opencode.jso
         "no_progress_token_threshold": 50,
         "max_no_progress_turns": 2,
         "restricted_agents": ["plan"],
-        "allow_goal_execution_from_plan": false
+        "allow_goal_execution_from_plan": false,
+        "max_objective_chars": 100000
       }
     ]
   ]
@@ -169,6 +170,7 @@ Defaults:
 - `command_name`: `"goal"`
 - `restricted_agents`: `["plan"]`; agents (matched case-insensitively) treated as planning-only for goal execution.
 - `allow_goal_execution_from_plan`: `false`; when `true`, disables Plan-mode goal restrictions entirely.
+- `max_objective_chars`: `100000`; maximum length of the goal objective, completion evidence, and blocker text. Applies to both the runtime validation and the tool schemas, so clients do not truncate long objectives before the tool is called.
 
 ## Goal Workflow
 

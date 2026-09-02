@@ -401,17 +401,31 @@ async function mutate<T>(fn: (state: State) => T | Promise<T>) {
   })
 }
 
+export const DEFAULT_MAX_OBJECTIVE_CHARS = 100_000
+let objectiveCharLimit = DEFAULT_MAX_OBJECTIVE_CHARS
+
+export function configureMaxObjectiveChars(value: number | null | undefined) {
+  objectiveCharLimit = typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : DEFAULT_MAX_OBJECTIVE_CHARS
+  return objectiveCharLimit
+}
+
+export function maxObjectiveChars() {
+  return objectiveCharLimit
+}
+
 export function validateObjective(objective: string) {
   const value = objective.trim()
   if (!value) throw new Error("goal objective must not be empty")
-  if ([...value].length > 4000) throw new Error("goal objective must be at most 4000 characters")
+  const limit = maxObjectiveChars()
+  if ([...value].length > limit) throw new Error(`goal objective must be at most ${limit} characters`)
   return value
 }
 
 export function validateEvidence(evidence: string | null | undefined, label: string) {
   const value = evidence?.trim()
   if (!value) throw new Error(`${label} must not be empty`)
-  if ([...value].length > 4000) throw new Error(`${label} must be at most 4000 characters`)
+  const limit = maxObjectiveChars()
+  if ([...value].length > limit) throw new Error(`${label} must be at most ${limit} characters`)
   return value
 }
 

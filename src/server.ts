@@ -8,13 +8,16 @@ import {
   accountUsage,
   clearGoal,
   completeGoal,
+  configureMaxObjectiveChars,
   createGoal,
+  DEFAULT_MAX_OBJECTIVE_CHARS,
   estimateTokensFromText,
   formatGoalHistory,
   getAllGoals,
   getGoal,
   getGoalInternal,
   markGoalUnmet,
+  maxObjectiveChars,
   pauseGoalForPlanMode,
   PLAN_MODE_STOP_REASON,
   recordAssistantProgress,
@@ -45,6 +48,7 @@ type Options = {
   max_no_progress_turns?: number
   restricted_agents?: string[]
   allow_goal_execution_from_plan?: boolean
+  max_objective_chars?: number
 }
 
 type CreateGoalArgs = {
@@ -154,7 +158,7 @@ Use the goal tools to handle this command:
 - If the arguments start with "edit ", update the current goal objective by calling update_goal_objective with the remaining text.
 - If the arguments start with "complete " or "done ", perform a completion audit against real artifacts and command output. Call update_goal with status "complete" only if the goal is achieved, using concise evidence from the audit.
 - If the arguments start with "unmet ", "blocked ", or "blocker ", call update_goal with status "unmet" only when the goal cannot be achieved or needs external input, using the remaining arguments as the blocker.
-- Otherwise, call get_goal first. If it returns a non-closed goal with the same objective, do not create it again; continue working from the returned state. If it returns a different non-closed goal, report that conflict instead of replacing it. Only when there is no non-closed goal, call create_goal once. Use the full arguments as the objective. If the user includes explicit budget instructions, pass token_budget, max_auto_turns, or max_duration_seconds to create_goal rather than leaving those words in the objective.
+- Otherwise, call get_goal first. If it returns a non-closed goal with the same objective, do not create it again; continue working from the returned state. If it returns a different non-closed goal, report that conflict instead of replacing it. Only when there is no non-closed goal, call create_goal once. Build the objective as a complete, faithful representation of the arguments: keep every requirement, constraint, scope boundary, and success criterion with no omissions or loss of meaning. You may restructure and rephrase for clarity and coherence, but do NOT compress, truncate, or drop any content, and do NOT substitute the content with references or pointers to external files. If the user includes explicit budget instructions, pass token_budget, max_auto_turns, or max_duration_seconds to create_goal rather than leaving those words in the objective.
 
 Create a goal only from these explicit command arguments. Do not infer a goal from unrelated session context. After create_goal succeeds or returns an existing matching goal, never call it again for this command; continue working from the returned goal state.`
 }
@@ -925,6 +929,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
   const maxPromptFailures = positiveIntegerOrNull(options?.max_prompt_failures) ?? DEFAULT_MAX_PROMPT_FAILURES
   const registerCommand = options?.register_command ?? true
   const commandName = commandNameFromOptions(options)
+  const objectiveChars = configureMaxObjectiveChars(positiveIntegerOrNull(options?.max_objective_chars) ?? DEFAULT_MAX_OBJECTIVE_CHARS)
   const taskTracker = new TaskTracker()
   const taskDeferredSessions = new Set<string>()
   const scheduledContinuations = new Map<string, ScheduledContinuation>()
@@ -1278,7 +1283,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
         description:
           "Create a goal only when explicitly requested by the user or system/developer instructions; do not infer goals from ordinary tasks. If any non-closed goal exists, this returns the existing goal as either reused or conflicting and must not be retried. While the session is in Plan mode, the goal is recorded as paused and execution requires the user to switch to Build mode.",
         args: {
-          objective: z.string().min(1).max(4000).describe("The concrete objective to start pursuing."),
+          objective: z.string().min(1).max(objectiveChars).describe("The concrete objective to start pursuing."),
           token_budget: z.number().int().positive().nullable().optional().describe("Optional positive token budget."),
           max_auto_turns: z.number().int().positive().nullable().optional().describe("Optional per-goal auto-continue limit."),
           max_duration_seconds: z.number().int().positive().nullable().optional().describe("Optional per-goal duration limit."),
@@ -1291,7 +1296,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
         description:
           "Set a new goal when the user explicitly asks the agent to formulate and set its own goal. The model should write the objective itself based on the user's explicit request. If any non-closed goal exists, this returns the existing goal as either reused or conflicting and must not be retried. While the session is in Plan mode, the goal is recorded as paused and execution requires the user to switch to Build mode.",
         args: {
-          objective: z.string().min(1).max(4000).describe("The model-formulated concrete objective to start pursuing."),
+          objective: z.string().min(1).max(objectiveChars).describe("The model-formulated concrete objective to start pursuing."),
           token_budget: z.number().int().positive().nullable().optional().describe("Optional positive token budget."),
           max_auto_turns: z.number().int().positive().nullable().optional().describe("Optional per-goal auto-continue limit."),
           max_duration_seconds: z.number().int().positive().nullable().optional().describe("Optional per-goal duration limit."),
@@ -1303,7 +1308,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
       update_goal_objective: {
         description: "Edit the current OpenCode goal objective when the user explicitly asks to edit or replace it.",
         args: {
-          objective: z.string().min(1).max(4000).describe("The updated concrete objective."),
+          objective: z.string().min(1).max(objectiveChars).describe("The updated concrete objective."),
           status: z.enum(["active", "paused"]).optional().describe("Whether the edited goal should be active or paused."),
         },
         async execute(args, context) {
@@ -1318,13 +1323,13 @@ const server: Plugin = async ({ client }, options?: Options) => {
           evidence: z
             .string()
             .min(1)
-            .max(4000)
+            .max(objectiveChars)
             .optional()
             .describe("Required when status is complete. Summarize the concrete evidence verified."),
           blocker: z
             .string()
             .min(1)
-            .max(4000)
+            .max(objectiveChars)
             .optional()
             .describe("Required when status is unmet. Explain the concrete blocker or impossibility."),
         },
@@ -1554,6 +1559,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   const maxPromptFailures = positiveIntegerOrNull(options.max_prompt_failures) ?? DEFAULT_MAX_PROMPT_FAILURES
   const registerCommand = options.register_command ?? true
   const commandName = commandNameFromOptions(options)
+  configureMaxObjectiveChars(positiveIntegerOrNull(options.max_objective_chars) ?? DEFAULT_MAX_OBJECTIVE_CHARS)
   const taskTracker = new TaskTracker()
   const taskDeferredSessions = new Set<string>()
   const scheduledContinuations = new Map<string, ScheduledContinuation>()
@@ -2233,7 +2239,7 @@ function goalToolsV2(services: GoalServices): ToolV2Info[] {
         "Create a goal only when explicitly requested by the user or system/developer instructions; do not infer goals from ordinary tasks. If any non-closed goal exists, this returns the existing goal as either reused or conflicting and must not be retried. While the session is in Plan mode, the goal is recorded as paused and execution requires the user to switch to Build mode.",
       input: v2ObjectSchema(
         {
-          objective: { type: "string", minLength: 1, maxLength: 4000, description: "The concrete objective to start pursuing." },
+          objective: { type: "string", minLength: 1, maxLength: maxObjectiveChars(), description: "The concrete objective to start pursuing." },
           token_budget: { type: ["integer", "null"], minimum: 1, description: "Optional positive token budget." },
           max_auto_turns: { type: ["integer", "null"], minimum: 1, description: "Optional per-goal auto-continue limit." },
           max_duration_seconds: { type: ["integer", "null"], minimum: 1, description: "Optional per-goal duration limit." },
@@ -2254,7 +2260,7 @@ function goalToolsV2(services: GoalServices): ToolV2Info[] {
           objective: {
             type: "string",
             minLength: 1,
-            maxLength: 4000,
+            maxLength: maxObjectiveChars(),
             description: "The model-formulated concrete objective to start pursuing.",
           },
           token_budget: { type: ["integer", "null"], minimum: 1, description: "Optional positive token budget." },
@@ -2273,7 +2279,7 @@ function goalToolsV2(services: GoalServices): ToolV2Info[] {
       description: "Edit the current OpenCode goal objective when the user explicitly asks to edit or replace it.",
       input: v2ObjectSchema(
         {
-          objective: { type: "string", minLength: 1, maxLength: 4000, description: "The updated concrete objective." },
+          objective: { type: "string", minLength: 1, maxLength: maxObjectiveChars(), description: "The updated concrete objective." },
           status: { type: "string", enum: ["active", "paused"], description: "Whether the edited goal should be active or paused." },
         },
         ["objective"],
@@ -2297,13 +2303,13 @@ function goalToolsV2(services: GoalServices): ToolV2Info[] {
           evidence: {
             type: "string",
             minLength: 1,
-            maxLength: 4000,
+            maxLength: maxObjectiveChars(),
             description: "Required when status is complete. Summarize the concrete evidence verified.",
           },
           blocker: {
             type: "string",
             minLength: 1,
-            maxLength: 4000,
+            maxLength: maxObjectiveChars(),
             description: "Required when status is unmet. Explain the concrete blocker or impossibility.",
           },
         },
