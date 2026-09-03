@@ -8,16 +8,13 @@ import {
   accountUsage,
   clearGoal,
   completeGoal,
-  configureMaxObjectiveChars,
   createGoal,
-  DEFAULT_MAX_OBJECTIVE_CHARS,
   estimateTokensFromText,
   formatGoalHistory,
   getAllGoals,
   getGoal,
   getGoalInternal,
   markGoalUnmet,
-  maxObjectiveChars,
   pauseGoalForPlanMode,
   PLAN_MODE_STOP_REASON,
   recordAssistantProgress,
@@ -28,7 +25,9 @@ import {
   reserveContinuation,
   rollbackContinuationAttempt,
   setGoalStatus,
+  resolveMaxObjectiveChars,
   updateGoalObjective,
+  validateEvidence,
   validateObjective,
 } from "./state"
 import { compactionContext, continuationPrompt, limitPrompt, systemReminder } from "./prompts"
@@ -781,13 +780,34 @@ type ToolExecContext = {
 
 type GoalServices = {
   options: Options
+  maxObjectiveChars: number
   isPlanAgent: (agent: unknown) => boolean
   initializeUsage?: (sessionID: string) => Promise<void>
 }
 
+function boundedGoalTextSchema(limit: number, description: string, validate: (value: string) => string) {
+  return z
+    .string()
+    .superRefine((value, ctx) => {
+      try {
+        validate(value)
+      } catch (error) {
+        ctx.addIssue({
+          code: "custom",
+          message: error instanceof Error ? error.message : String(error),
+        })
+      }
+    })
+    .meta({ minLength: 1, maxLength: limit, description })
+}
+
+function v2GoalTextSchema(limit: number, description: string) {
+  return { type: "string" as const, minLength: 1, maxLength: limit, description }
+}
+
 async function createGoalFromTool(input: CreateGoalArgs, context: ToolExecContext, services: GoalServices) {
   const planningOnly = services.isPlanAgent(context.agent)
-  const objective = validateObjective(input.objective)
+  const objective = validateObjective(input.objective, services.maxObjectiveChars)
   const existing = await getGoal(context.sessionID)
   if (existing && !isClosedGoal(existing)) return existingGoalResult(existing, objective, planningOnly)
 
@@ -801,6 +821,7 @@ async function createGoalFromTool(input: CreateGoalArgs, context: ToolExecContex
       maxNoProgressTurns: services.options.max_no_progress_turns ?? null,
       agent: typeof context.agent === "string" ? context.agent : null,
       initialStatus: planningOnly ? "paused" : "active",
+      maxObjectiveChars: services.maxObjectiveChars,
     })
   } catch (error) {
     if (!(error instanceof Error) || !error.message.includes("non-closed goal")) throw error
@@ -844,18 +865,19 @@ async function updateGoalObjectiveFromTool(
   const goal = await updateGoalObjective(context.sessionID, input.objective, planningOnly ? "paused" : requested, {
     agent: typeof context.agent === "string" ? context.agent : null,
     planModePause: planningOnly,
+    maxObjectiveChars: services.maxObjectiveChars,
   })
   return JSON.stringify(planningOnly ? { goal, plan_mode_notice: PLAN_MODE_CREATE_NOTICE } : { goal }, null, 2)
 }
 
-async function closeGoalFromTool(input: UpdateGoalArgs, context: ToolExecContext) {
+async function closeGoalFromTool(input: UpdateGoalArgs, context: ToolExecContext, services: GoalServices) {
   if (input.status === "complete") {
-    const goal = await completeGoal(context.sessionID, input.evidence ?? "")
+    const goal = await completeGoal(context.sessionID, input.evidence ?? "", services.maxObjectiveChars)
     const budget = goal.tokenBudget == null ? "" : ` Token usage: ${goal.tokensUsed}/${goal.tokenBudget}.`
     const report = `Goal achieved. Time used: ${goal.timeUsedSeconds} seconds.${budget} Evidence: ${goal.completionEvidence}.`
     return JSON.stringify({ goal, completion_report: report }, null, 2)
   }
-  const goal = await markGoalUnmet(context.sessionID, input.blocker ?? "")
+  const goal = await markGoalUnmet(context.sessionID, input.blocker ?? "", services.maxObjectiveChars)
   const report = `Goal unmet. Time used: ${goal.timeUsedSeconds} seconds. Blocker: ${goal.blocker}.`
   return JSON.stringify({ goal, unmet_report: report }, null, 2)
 }
@@ -929,7 +951,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
   const maxPromptFailures = positiveIntegerOrNull(options?.max_prompt_failures) ?? DEFAULT_MAX_PROMPT_FAILURES
   const registerCommand = options?.register_command ?? true
   const commandName = commandNameFromOptions(options)
-  const objectiveChars = configureMaxObjectiveChars(positiveIntegerOrNull(options?.max_objective_chars) ?? DEFAULT_MAX_OBJECTIVE_CHARS)
+  const objectiveChars = resolveMaxObjectiveChars(options?.max_objective_chars)
   const taskTracker = new TaskTracker()
   const taskDeferredSessions = new Set<string>()
   const scheduledContinuations = new Map<string, ScheduledContinuation>()
@@ -948,7 +970,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
   const watchdogRescuedSessions = new Set<string>()
   const planAgents = restrictedAgentSet(options)
   const isPlanAgent = (agent: unknown) => typeof agent === "string" && planAgents.has(agent.trim().toLowerCase())
-  const goalServices: GoalServices = { options: options ?? {}, isPlanAgent }
+  const goalServices: GoalServices = { options: options ?? {}, isPlanAgent, maxObjectiveChars: objectiveChars }
   // Set by dispose so in-flight operations triggered before disposal cannot
   // schedule new timers or invoke continuations afterward.
   let disposed = false
@@ -1283,7 +1305,9 @@ const server: Plugin = async ({ client }, options?: Options) => {
         description:
           "Create a goal only when explicitly requested by the user or system/developer instructions; do not infer goals from ordinary tasks. If any non-closed goal exists, this returns the existing goal as either reused or conflicting and must not be retried. While the session is in Plan mode, the goal is recorded as paused and execution requires the user to switch to Build mode.",
         args: {
-          objective: z.string().min(1).max(objectiveChars).describe("The concrete objective to start pursuing."),
+          objective: boundedGoalTextSchema(objectiveChars, "The concrete objective to start pursuing.", (value) =>
+            validateObjective(value, objectiveChars),
+          ),
           token_budget: z.number().int().positive().nullable().optional().describe("Optional positive token budget."),
           max_auto_turns: z.number().int().positive().nullable().optional().describe("Optional per-goal auto-continue limit."),
           max_duration_seconds: z.number().int().positive().nullable().optional().describe("Optional per-goal duration limit."),
@@ -1296,7 +1320,11 @@ const server: Plugin = async ({ client }, options?: Options) => {
         description:
           "Set a new goal when the user explicitly asks the agent to formulate and set its own goal. The model should write the objective itself based on the user's explicit request. If any non-closed goal exists, this returns the existing goal as either reused or conflicting and must not be retried. While the session is in Plan mode, the goal is recorded as paused and execution requires the user to switch to Build mode.",
         args: {
-          objective: z.string().min(1).max(objectiveChars).describe("The model-formulated concrete objective to start pursuing."),
+          objective: boundedGoalTextSchema(
+            objectiveChars,
+            "The model-formulated concrete objective to start pursuing.",
+            (value) => validateObjective(value, objectiveChars),
+          ),
           token_budget: z.number().int().positive().nullable().optional().describe("Optional positive token budget."),
           max_auto_turns: z.number().int().positive().nullable().optional().describe("Optional per-goal auto-continue limit."),
           max_duration_seconds: z.number().int().positive().nullable().optional().describe("Optional per-goal duration limit."),
@@ -1308,7 +1336,9 @@ const server: Plugin = async ({ client }, options?: Options) => {
       update_goal_objective: {
         description: "Edit the current OpenCode goal objective when the user explicitly asks to edit or replace it.",
         args: {
-          objective: z.string().min(1).max(objectiveChars).describe("The updated concrete objective."),
+          objective: boundedGoalTextSchema(objectiveChars, "The updated concrete objective.", (value) =>
+            validateObjective(value, objectiveChars),
+          ),
           status: z.enum(["active", "paused"]).optional().describe("Whether the edited goal should be active or paused."),
         },
         async execute(args, context) {
@@ -1320,21 +1350,19 @@ const server: Plugin = async ({ client }, options?: Options) => {
           "Close the existing goal only after an audit against real evidence. Use status complete only when the objective is achieved and no required work remains, and include evidence. Use status unmet only when the objective cannot be achieved or is blocked, and include the blocker. Do not close a goal merely because work is stopping.",
         args: {
           status: z.enum(["complete", "unmet"]).describe("Required. complete means achieved; unmet means blocked or impossible."),
-          evidence: z
-            .string()
-            .min(1)
-            .max(objectiveChars)
-            .optional()
-            .describe("Required when status is complete. Summarize the concrete evidence verified."),
-          blocker: z
-            .string()
-            .min(1)
-            .max(objectiveChars)
-            .optional()
-            .describe("Required when status is unmet. Explain the concrete blocker or impossibility."),
+          evidence: boundedGoalTextSchema(
+            objectiveChars,
+            "Required when status is complete. Summarize the concrete evidence verified.",
+            (value) => validateEvidence(value, "completion evidence", objectiveChars),
+          ).optional(),
+          blocker: boundedGoalTextSchema(
+            objectiveChars,
+            "Required when status is unmet. Explain the concrete blocker or impossibility.",
+            (value) => validateEvidence(value, "blocker", objectiveChars),
+          ).optional(),
         },
         async execute(args, context) {
-          return closeGoalFromTool(args as UpdateGoalArgs, context)
+          return closeGoalFromTool(args as UpdateGoalArgs, context, goalServices)
         },
       },
       update_goal_status: {
@@ -1559,7 +1587,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   const maxPromptFailures = positiveIntegerOrNull(options.max_prompt_failures) ?? DEFAULT_MAX_PROMPT_FAILURES
   const registerCommand = options.register_command ?? true
   const commandName = commandNameFromOptions(options)
-  configureMaxObjectiveChars(positiveIntegerOrNull(options.max_objective_chars) ?? DEFAULT_MAX_OBJECTIVE_CHARS)
+  const objectiveChars = resolveMaxObjectiveChars(options.max_objective_chars)
   const taskTracker = new TaskTracker()
   const taskDeferredSessions = new Set<string>()
   const scheduledContinuations = new Map<string, ScheduledContinuation>()
@@ -1579,6 +1607,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   const stepTokenSums = new Map<string, number>()
   const goalServices: GoalServices = {
     options,
+    maxObjectiveChars: objectiveChars,
     isPlanAgent,
     initializeUsage: async (sessionID) => {
       try {
@@ -2239,7 +2268,7 @@ function goalToolsV2(services: GoalServices): ToolV2Info[] {
         "Create a goal only when explicitly requested by the user or system/developer instructions; do not infer goals from ordinary tasks. If any non-closed goal exists, this returns the existing goal as either reused or conflicting and must not be retried. While the session is in Plan mode, the goal is recorded as paused and execution requires the user to switch to Build mode.",
       input: v2ObjectSchema(
         {
-          objective: { type: "string", minLength: 1, maxLength: maxObjectiveChars(), description: "The concrete objective to start pursuing." },
+          objective: v2GoalTextSchema(services.maxObjectiveChars, "The concrete objective to start pursuing."),
           token_budget: { type: ["integer", "null"], minimum: 1, description: "Optional positive token budget." },
           max_auto_turns: { type: ["integer", "null"], minimum: 1, description: "Optional per-goal auto-continue limit." },
           max_duration_seconds: { type: ["integer", "null"], minimum: 1, description: "Optional per-goal duration limit." },
@@ -2257,12 +2286,7 @@ function goalToolsV2(services: GoalServices): ToolV2Info[] {
         "Set a new goal when the user explicitly asks the agent to formulate and set its own goal. The model should write the objective itself based on the user's explicit request. If any non-closed goal exists, this returns the existing goal as either reused or conflicting and must not be retried. While the session is in Plan mode, the goal is recorded as paused and execution requires the user to switch to Build mode.",
       input: v2ObjectSchema(
         {
-          objective: {
-            type: "string",
-            minLength: 1,
-            maxLength: maxObjectiveChars(),
-            description: "The model-formulated concrete objective to start pursuing.",
-          },
+          objective: v2GoalTextSchema(services.maxObjectiveChars, "The model-formulated concrete objective to start pursuing."),
           token_budget: { type: ["integer", "null"], minimum: 1, description: "Optional positive token budget." },
           max_auto_turns: { type: ["integer", "null"], minimum: 1, description: "Optional per-goal auto-continue limit." },
           max_duration_seconds: { type: ["integer", "null"], minimum: 1, description: "Optional per-goal duration limit." },
@@ -2279,7 +2303,7 @@ function goalToolsV2(services: GoalServices): ToolV2Info[] {
       description: "Edit the current OpenCode goal objective when the user explicitly asks to edit or replace it.",
       input: v2ObjectSchema(
         {
-          objective: { type: "string", minLength: 1, maxLength: maxObjectiveChars(), description: "The updated concrete objective." },
+          objective: v2GoalTextSchema(services.maxObjectiveChars, "The updated concrete objective."),
           status: { type: "string", enum: ["active", "paused"], description: "Whether the edited goal should be active or paused." },
         },
         ["objective"],
@@ -2300,24 +2324,20 @@ function goalToolsV2(services: GoalServices): ToolV2Info[] {
             enum: ["complete", "unmet"],
             description: "Required. complete means achieved; unmet means blocked or impossible.",
           },
-          evidence: {
-            type: "string",
-            minLength: 1,
-            maxLength: maxObjectiveChars(),
-            description: "Required when status is complete. Summarize the concrete evidence verified.",
-          },
-          blocker: {
-            type: "string",
-            minLength: 1,
-            maxLength: maxObjectiveChars(),
-            description: "Required when status is unmet. Explain the concrete blocker or impossibility.",
-          },
+          evidence: v2GoalTextSchema(
+            services.maxObjectiveChars,
+            "Required when status is complete. Summarize the concrete evidence verified.",
+          ),
+          blocker: v2GoalTextSchema(
+            services.maxObjectiveChars,
+            "Required when status is unmet. Explain the concrete blocker or impossibility.",
+          ),
         },
         ["status"],
       ),
       options: { codemode: false },
       execute: async (args, toolContext) => ({
-        content: await closeGoalFromTool(args as UpdateGoalArgs, toolContext),
+        content: await closeGoalFromTool(args as UpdateGoalArgs, toolContext, services),
       }),
     },
     {

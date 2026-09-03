@@ -2,11 +2,10 @@ import { afterEach, beforeEach, expect, setSystemTime, test } from "bun:test"
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
+import { z } from "zod"
 import plugin from "../src/server"
 import {
   accountUsage,
-  configureMaxObjectiveChars,
-  DEFAULT_MAX_OBJECTIVE_CHARS,
   getGoal,
   getGoalInternal,
   recordContinuationResult,
@@ -16,6 +15,28 @@ import {
 function requireTool<T>(tool: T | undefined, name: string): T {
   if (!tool) throw new Error(`expected ${name} to be registered`)
   return tool
+}
+
+type ToolArgs = {
+  args: Record<string, z.ZodType | undefined>
+  execute: (args: unknown, context: unknown) => Promise<unknown>
+}
+
+function toolArgs(tool: { args?: unknown } | undefined, name: string): ToolArgs {
+  const resolved = requireTool(tool, name) as ToolArgs
+  if (!resolved.args) throw new Error(`expected ${name} to expose args`)
+  return resolved
+}
+
+function argSchema(args: ToolArgs["args"], key: string) {
+  const schema = args[key]
+  if (!schema) throw new Error(`expected args.${key}`)
+  return schema
+}
+
+function advertisedMax(schema: z.ZodType) {
+  const json = z.toJSONSchema(schema) as { maxLength?: number }
+  return json.maxLength
 }
 
 async function waitFor(predicate: () => boolean) {
@@ -59,7 +80,6 @@ beforeEach(async () => {
 
 afterEach(async () => {
   for (const dispose of serverDisposers.splice(0).reverse()) await dispose()
-  configureMaxObjectiveChars(DEFAULT_MAX_OBJECTIVE_CHARS)
   delete process.env.OPENCODE_GOAL_STATE_PATH
   await rm(dir, { recursive: true, force: true })
 })
@@ -163,7 +183,7 @@ test("set goal lets the agent formulate the goal objective", async () => {
 test("create_goal reuses the same active objective without mutating state", async () => {
   const hooks = await setupServer(
     { client: { session: { promptAsync: async () => {} } } } as never,
-    { auto_continue: false, max_objective_chars: 4000 },
+    { auto_continue: false },
   )
   const tools = hooks.tool!
   const context = { sessionID: "ses_1" } as never
@@ -189,9 +209,64 @@ test("create_goal reuses the same active objective without mutating state", asyn
   await expect(
     requireTool(tools.create_goal, "create_goal").execute({ objective: "   " }, context),
   ).rejects.toThrow("must not be empty")
+})
+
+test("max_objective_chars is advertised and enforced per V1 instance", async () => {
+  const client = { client: { session: { promptAsync: async () => {} } } } as never
+  const wide = await setupServer(client, { auto_continue: false, max_objective_chars: 100 })
+  const narrow = await setupServer(client, { auto_continue: false, max_objective_chars: 10 })
+  const defaulted = await setupServer(client, { auto_continue: false })
+  const wideCreate = toolArgs(wide.tool?.create_goal, "create_goal")
+  const narrowCreate = toolArgs(narrow.tool?.create_goal, "create_goal")
+  const defaultCreate = toolArgs(defaulted.tool?.create_goal, "create_goal")
+  const wideUpdate = toolArgs(wide.tool?.update_goal, "update_goal")
+  const wideSet = toolArgs(wide.tool?.set_goal, "set_goal")
+  const wideEdit = toolArgs(wide.tool?.update_goal_objective, "update_goal_objective")
+
+  const wideObjective = argSchema(wideCreate.args, "objective")
+  const narrowObjective = argSchema(narrowCreate.args, "objective")
+  expect(advertisedMax(wideObjective)).toBe(100)
+  expect(advertisedMax(narrowObjective)).toBe(10)
+  expect(advertisedMax(argSchema(defaultCreate.args, "objective"))).toBe(100_000)
+  expect(advertisedMax(argSchema(wideSet.args, "objective"))).toBe(100)
+  expect(advertisedMax(argSchema(wideEdit.args, "objective"))).toBe(100)
+  expect(advertisedMax(argSchema(wideUpdate.args, "evidence"))).toBe(100)
+  expect(advertisedMax(argSchema(wideUpdate.args, "blocker"))).toBe(100)
+
+  expect(wideObjective.safeParse("😀").success).toBe(true)
+  expect(wideObjective.safeParse(" a ").success).toBe(true)
+  expect(wideObjective.safeParse("   ").success).toBe(false)
+  expect(wideObjective.safeParse("x".repeat(101)).success).toBe(false)
+  expect(narrowObjective.safeParse("x".repeat(11)).success).toBe(false)
+
+  const wideContext = { sessionID: "ses_wide" } as never
+  const narrowContext = { sessionID: "ses_narrow" } as never
+  await expect(wideCreate.execute({ objective: "x".repeat(11) }, wideContext)).resolves.toContain('"status": "active"')
+  await expect(narrowCreate.execute({ objective: "x".repeat(11) }, narrowContext)).rejects.toThrow(
+    "at most 10 characters",
+  )
+  await expect(wideCreate.execute({ objective: "😀".repeat(100) }, { sessionID: "ses_emoji" } as never)).resolves.toContain(
+    '"status": "active"',
+  )
+  await expect(wideCreate.execute({ objective: "  y  " }, { sessionID: "ses_trim" } as never)).resolves.toContain(
+    '"objective": "y"',
+  )
   await expect(
-    requireTool(tools.create_goal, "create_goal").execute({ objective: "x".repeat(4_001) }, context),
-  ).rejects.toThrow("at most 4000 characters")
+    defaultCreate.execute({ objective: "x".repeat(100_001) }, { sessionID: "ses_default" } as never),
+  ).rejects.toThrow("at most 100000 characters")
+
+  await wideCreate.execute({ objective: "close me" }, { sessionID: "ses_close" } as never)
+  await expect(
+    wideUpdate.execute({ status: "complete", evidence: "x".repeat(101) }, { sessionID: "ses_close" } as never),
+  ).rejects.toThrow("at most 100 characters")
+  await expect(
+    wideUpdate.execute({ status: "unmet", blocker: "x".repeat(101) }, { sessionID: "ses_close" } as never),
+  ).rejects.toThrow("at most 100 characters")
+  const closed = await wideUpdate.execute(
+    { status: "complete", evidence: "x".repeat(100) },
+    { sessionID: "ses_close" } as never,
+  )
+  expect(String(closed)).toContain('"completion_report"')
 })
 
 test("create_goal starts a fresh goal when the matching prior goal is closed", async () => {
@@ -275,6 +350,8 @@ test("server plugin registers goal as a desktop/web command by default", async (
   expect(config.command?.goal?.template).toContain("call get_goal first")
   expect(config.command?.goal?.template).toContain("call create_goal once")
   expect(config.command?.goal?.template).toContain("never call it again")
+  expect(config.command?.goal?.template).toContain("faithful representation")
+  expect(config.command?.goal?.template).toContain("do NOT compress, truncate")
 })
 
 test("system transform is byte-stable across the complete goal lifecycle", async () => {

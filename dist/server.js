@@ -289,31 +289,22 @@ async function mutate(fn) {
   });
 }
 var DEFAULT_MAX_OBJECTIVE_CHARS = 1e5;
-var objectiveCharLimit = DEFAULT_MAX_OBJECTIVE_CHARS;
-function configureMaxObjectiveChars(value) {
-  objectiveCharLimit = typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : DEFAULT_MAX_OBJECTIVE_CHARS;
-  return objectiveCharLimit;
+function resolveMaxObjectiveChars(value) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : DEFAULT_MAX_OBJECTIVE_CHARS;
 }
-function maxObjectiveChars() {
-  return objectiveCharLimit;
-}
-function validateObjective(objective) {
-  const value = objective.trim();
-  if (!value)
-    throw new Error("goal objective must not be empty");
-  const limit = maxObjectiveChars();
-  if ([...value].length > limit)
-    throw new Error(`goal objective must be at most ${limit} characters`);
-  return value;
-}
-function validateEvidence(evidence, label) {
-  const value = evidence?.trim();
-  if (!value)
+function boundedText(value, limit, label) {
+  const trimmed = value.trim();
+  if (!trimmed)
     throw new Error(`${label} must not be empty`);
-  const limit = maxObjectiveChars();
-  if ([...value].length > limit)
+  if ([...trimmed].length > limit)
     throw new Error(`${label} must be at most ${limit} characters`);
-  return value;
+  return trimmed;
+}
+function validateObjective(objective, limit = DEFAULT_MAX_OBJECTIVE_CHARS) {
+  return boundedText(objective, limit, "goal objective");
+}
+function validateEvidence(evidence, label, limit = DEFAULT_MAX_OBJECTIVE_CHARS) {
+  return boundedText(evidence ?? "", limit, label);
 }
 function normalizeState(state) {
   for (const goal of Object.values(state.goals))
@@ -389,7 +380,8 @@ function normalizeCreateOptions(input) {
       noProgressTokenThreshold: DEFAULT_NO_PROGRESS_TOKEN_THRESHOLD,
       maxNoProgressTurns: DEFAULT_MAX_NO_PROGRESS_TURNS,
       agent: null,
-      initialStatus: "active"
+      initialStatus: "active",
+      maxObjectiveChars: DEFAULT_MAX_OBJECTIVE_CHARS
     };
   }
   return {
@@ -399,7 +391,8 @@ function normalizeCreateOptions(input) {
     noProgressTokenThreshold: positiveIntegerOrNull(input?.noProgressTokenThreshold) ?? DEFAULT_NO_PROGRESS_TOKEN_THRESHOLD,
     maxNoProgressTurns: positiveIntegerOrNull(input?.maxNoProgressTurns) ?? DEFAULT_MAX_NO_PROGRESS_TURNS,
     agent: typeof input?.agent === "string" && input.agent.trim() ? input.agent.trim() : null,
-    initialStatus: input?.initialStatus === "paused" ? "paused" : "active"
+    initialStatus: input?.initialStatus === "paused" ? "paused" : "active",
+    maxObjectiveChars: resolveMaxObjectiveChars(input?.maxObjectiveChars)
   };
 }
 function positiveIntegerOrNull(value) {
@@ -499,8 +492,8 @@ async function getGoalInternal(sessionID) {
   return goal ? snapshotInternal(goal) : null;
 }
 async function createGoal(sessionID, objective, options) {
-  const value = validateObjective(objective);
   const normalizedOptions = normalizeCreateOptions(options);
+  const value = validateObjective(objective, resolveMaxObjectiveChars(normalizedOptions.maxObjectiveChars));
   return mutate((state) => {
     const existing = state.goals[sessionID];
     if (existing && !isClosed(existing.status)) {
@@ -552,7 +545,7 @@ async function createGoal(sessionID, objective, options) {
   });
 }
 async function updateGoalObjective(sessionID, objective, status = "active", options) {
-  const value = validateObjective(objective);
+  const value = validateObjective(objective, resolveMaxObjectiveChars(options?.maxObjectiveChars));
   const agent = typeof options?.agent === "string" && options.agent.trim() ? options.agent.trim() : null;
   const planModePause = options?.planModePause === true;
   return mutate((state) => {
@@ -637,7 +630,8 @@ async function setGoalStatus(sessionID, status, agent) {
     return snapshot(goal);
   });
 }
-async function closeGoal(sessionID, input) {
+async function closeGoal(sessionID, input, maxObjectiveChars = DEFAULT_MAX_OBJECTIVE_CHARS) {
+  const limit = resolveMaxObjectiveChars(maxObjectiveChars);
   return mutate((state) => {
     const goal = state.goals[sessionID];
     if (!goal)
@@ -650,12 +644,12 @@ async function closeGoal(sessionID, input) {
     goal.lastAccountedAt = null;
     goal.stopReason = input.status === "complete" ? null : "blocked";
     if (input.status === "complete") {
-      goal.completionEvidence = validateEvidence(input.evidence, "completion evidence");
+      goal.completionEvidence = validateEvidence(input.evidence, "completion evidence", limit);
       goal.blocker = null;
       goal.lastStatus = "Goal completed.";
       pushHistory(goal, "completed", goal.completionEvidence);
     } else {
-      goal.blocker = validateEvidence(input.blocker, "blocker");
+      goal.blocker = validateEvidence(input.blocker, "blocker", limit);
       goal.completionEvidence = null;
       goal.lastStatus = "Goal marked unmet.";
       pushHistory(goal, "unmet", goal.blocker);
@@ -663,11 +657,11 @@ async function closeGoal(sessionID, input) {
     return snapshot(goal);
   });
 }
-async function completeGoal(sessionID, evidence) {
-  return closeGoal(sessionID, { status: "complete", evidence });
+async function completeGoal(sessionID, evidence, maxObjectiveChars = DEFAULT_MAX_OBJECTIVE_CHARS) {
+  return closeGoal(sessionID, { status: "complete", evidence }, maxObjectiveChars);
 }
-async function markGoalUnmet(sessionID, blocker) {
-  return closeGoal(sessionID, { status: "unmet", blocker });
+async function markGoalUnmet(sessionID, blocker, maxObjectiveChars = DEFAULT_MAX_OBJECTIVE_CHARS) {
+  return closeGoal(sessionID, { status: "unmet", blocker }, maxObjectiveChars);
 }
 async function clearGoal(sessionID) {
   return mutate((state) => {
@@ -1811,9 +1805,24 @@ function getGoalToolResult(goal) {
   }
   return JSON.stringify(result, null, 2);
 }
+function boundedGoalTextSchema(limit, description, validate) {
+  return z.string().superRefine((value, ctx) => {
+    try {
+      validate(value);
+    } catch (error) {
+      ctx.addIssue({
+        code: "custom",
+        message: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }).meta({ minLength: 1, maxLength: limit, description });
+}
+function v2GoalTextSchema(limit, description) {
+  return { type: "string", minLength: 1, maxLength: limit, description };
+}
 async function createGoalFromTool(input, context, services) {
   const planningOnly = services.isPlanAgent(context.agent);
-  const objective = validateObjective(input.objective);
+  const objective = validateObjective(input.objective, services.maxObjectiveChars);
   const existing = await getGoal(context.sessionID);
   if (existing && !isClosedGoal(existing))
     return existingGoalResult(existing, objective, planningOnly);
@@ -1826,7 +1835,8 @@ async function createGoalFromTool(input, context, services) {
       noProgressTokenThreshold: services.options.no_progress_token_threshold ?? null,
       maxNoProgressTurns: services.options.max_no_progress_turns ?? null,
       agent: typeof context.agent === "string" ? context.agent : null,
-      initialStatus: planningOnly ? "paused" : "active"
+      initialStatus: planningOnly ? "paused" : "active",
+      maxObjectiveChars: services.maxObjectiveChars
     });
   } catch (error) {
     if (!(error instanceof Error) || !error.message.includes("non-closed goal"))
@@ -1856,18 +1866,19 @@ async function updateGoalObjectiveFromTool(input, context, services) {
   const planningOnly = requested === "active" && services.isPlanAgent(context.agent);
   const goal = await updateGoalObjective(context.sessionID, input.objective, planningOnly ? "paused" : requested, {
     agent: typeof context.agent === "string" ? context.agent : null,
-    planModePause: planningOnly
+    planModePause: planningOnly,
+    maxObjectiveChars: services.maxObjectiveChars
   });
   return JSON.stringify(planningOnly ? { goal, plan_mode_notice: PLAN_MODE_CREATE_NOTICE } : { goal }, null, 2);
 }
-async function closeGoalFromTool(input, context) {
+async function closeGoalFromTool(input, context, services) {
   if (input.status === "complete") {
-    const goal2 = await completeGoal(context.sessionID, input.evidence ?? "");
+    const goal2 = await completeGoal(context.sessionID, input.evidence ?? "", services.maxObjectiveChars);
     const budget = goal2.tokenBudget == null ? "" : ` Token usage: ${goal2.tokensUsed}/${goal2.tokenBudget}.`;
     const report2 = `Goal achieved. Time used: ${goal2.timeUsedSeconds} seconds.${budget} Evidence: ${goal2.completionEvidence}.`;
     return JSON.stringify({ goal: goal2, completion_report: report2 }, null, 2);
   }
-  const goal = await markGoalUnmet(context.sessionID, input.blocker ?? "");
+  const goal = await markGoalUnmet(context.sessionID, input.blocker ?? "", services.maxObjectiveChars);
   const report = `Goal unmet. Time used: ${goal.timeUsedSeconds} seconds. Blocker: ${goal.blocker}.`;
   return JSON.stringify({ goal, unmet_report: report }, null, 2);
 }
@@ -1916,7 +1927,7 @@ var server = async ({ client }, options) => {
   const maxPromptFailures = positiveIntegerOrNull2(options?.max_prompt_failures) ?? DEFAULT_MAX_PROMPT_FAILURES;
   const registerCommand = options?.register_command ?? true;
   const commandName = commandNameFromOptions(options);
-  const objectiveChars = configureMaxObjectiveChars(positiveIntegerOrNull2(options?.max_objective_chars) ?? DEFAULT_MAX_OBJECTIVE_CHARS);
+  const objectiveChars = resolveMaxObjectiveChars(options?.max_objective_chars);
   const taskTracker = new TaskTracker;
   const taskDeferredSessions = new Set;
   const scheduledContinuations = new Map;
@@ -1928,7 +1939,7 @@ var server = async ({ client }, options) => {
   const watchdogRescuedSessions = new Set;
   const planAgents = restrictedAgentSet(options);
   const isPlanAgent = (agent) => typeof agent === "string" && planAgents.has(agent.trim().toLowerCase());
-  const goalServices = { options: options ?? {}, isPlanAgent };
+  const goalServices = { options: options ?? {}, isPlanAgent, maxObjectiveChars: objectiveChars };
   let disposed = false;
   async function taskBlockStatus(sessionID) {
     if (!deferWhileTasksActive)
@@ -2219,7 +2230,7 @@ var server = async ({ client }, options) => {
       create_goal: {
         description: "Create a goal only when explicitly requested by the user or system/developer instructions; do not infer goals from ordinary tasks. If any non-closed goal exists, this returns the existing goal as either reused or conflicting and must not be retried. While the session is in Plan mode, the goal is recorded as paused and execution requires the user to switch to Build mode.",
         args: {
-          objective: z.string().min(1).max(objectiveChars).describe("The concrete objective to start pursuing."),
+          objective: boundedGoalTextSchema(objectiveChars, "The concrete objective to start pursuing.", (value) => validateObjective(value, objectiveChars)),
           token_budget: z.number().int().positive().nullable().optional().describe("Optional positive token budget."),
           max_auto_turns: z.number().int().positive().nullable().optional().describe("Optional per-goal auto-continue limit."),
           max_duration_seconds: z.number().int().positive().nullable().optional().describe("Optional per-goal duration limit.")
@@ -2231,7 +2242,7 @@ var server = async ({ client }, options) => {
       set_goal: {
         description: "Set a new goal when the user explicitly asks the agent to formulate and set its own goal. The model should write the objective itself based on the user's explicit request. If any non-closed goal exists, this returns the existing goal as either reused or conflicting and must not be retried. While the session is in Plan mode, the goal is recorded as paused and execution requires the user to switch to Build mode.",
         args: {
-          objective: z.string().min(1).max(objectiveChars).describe("The model-formulated concrete objective to start pursuing."),
+          objective: boundedGoalTextSchema(objectiveChars, "The model-formulated concrete objective to start pursuing.", (value) => validateObjective(value, objectiveChars)),
           token_budget: z.number().int().positive().nullable().optional().describe("Optional positive token budget."),
           max_auto_turns: z.number().int().positive().nullable().optional().describe("Optional per-goal auto-continue limit."),
           max_duration_seconds: z.number().int().positive().nullable().optional().describe("Optional per-goal duration limit.")
@@ -2243,7 +2254,7 @@ var server = async ({ client }, options) => {
       update_goal_objective: {
         description: "Edit the current OpenCode goal objective when the user explicitly asks to edit or replace it.",
         args: {
-          objective: z.string().min(1).max(objectiveChars).describe("The updated concrete objective."),
+          objective: boundedGoalTextSchema(objectiveChars, "The updated concrete objective.", (value) => validateObjective(value, objectiveChars)),
           status: z.enum(["active", "paused"]).optional().describe("Whether the edited goal should be active or paused.")
         },
         async execute(args, context) {
@@ -2254,11 +2265,11 @@ var server = async ({ client }, options) => {
         description: "Close the existing goal only after an audit against real evidence. Use status complete only when the objective is achieved and no required work remains, and include evidence. Use status unmet only when the objective cannot be achieved or is blocked, and include the blocker. Do not close a goal merely because work is stopping.",
         args: {
           status: z.enum(["complete", "unmet"]).describe("Required. complete means achieved; unmet means blocked or impossible."),
-          evidence: z.string().min(1).max(objectiveChars).optional().describe("Required when status is complete. Summarize the concrete evidence verified."),
-          blocker: z.string().min(1).max(objectiveChars).optional().describe("Required when status is unmet. Explain the concrete blocker or impossibility.")
+          evidence: boundedGoalTextSchema(objectiveChars, "Required when status is complete. Summarize the concrete evidence verified.", (value) => validateEvidence(value, "completion evidence", objectiveChars)).optional(),
+          blocker: boundedGoalTextSchema(objectiveChars, "Required when status is unmet. Explain the concrete blocker or impossibility.", (value) => validateEvidence(value, "blocker", objectiveChars)).optional()
         },
         async execute(args, context) {
-          return closeGoalFromTool(args, context);
+          return closeGoalFromTool(args, context, goalServices);
         }
       },
       update_goal_status: {
@@ -2465,7 +2476,7 @@ async function setupV2(context) {
   const maxPromptFailures = positiveIntegerOrNull2(options.max_prompt_failures) ?? DEFAULT_MAX_PROMPT_FAILURES;
   const registerCommand = options.register_command ?? true;
   const commandName = commandNameFromOptions(options);
-  configureMaxObjectiveChars(positiveIntegerOrNull2(options.max_objective_chars) ?? DEFAULT_MAX_OBJECTIVE_CHARS);
+  const objectiveChars = resolveMaxObjectiveChars(options.max_objective_chars);
   const taskTracker = new TaskTracker;
   const taskDeferredSessions = new Set;
   const scheduledContinuations = new Map;
@@ -2483,6 +2494,7 @@ async function setupV2(context) {
   const stepTokenSums = new Map;
   const goalServices = {
     options,
+    maxObjectiveChars: objectiveChars,
     isPlanAgent,
     initializeUsage: async (sessionID) => {
       try {
@@ -3105,7 +3117,7 @@ function goalToolsV2(services) {
       name: "create_goal",
       description: "Create a goal only when explicitly requested by the user or system/developer instructions; do not infer goals from ordinary tasks. If any non-closed goal exists, this returns the existing goal as either reused or conflicting and must not be retried. While the session is in Plan mode, the goal is recorded as paused and execution requires the user to switch to Build mode.",
       input: v2ObjectSchema({
-        objective: { type: "string", minLength: 1, maxLength: maxObjectiveChars(), description: "The concrete objective to start pursuing." },
+        objective: v2GoalTextSchema(services.maxObjectiveChars, "The concrete objective to start pursuing."),
         token_budget: { type: ["integer", "null"], minimum: 1, description: "Optional positive token budget." },
         max_auto_turns: { type: ["integer", "null"], minimum: 1, description: "Optional per-goal auto-continue limit." },
         max_duration_seconds: { type: ["integer", "null"], minimum: 1, description: "Optional per-goal duration limit." }
@@ -3119,12 +3131,7 @@ function goalToolsV2(services) {
       name: "set_goal",
       description: "Set a new goal when the user explicitly asks the agent to formulate and set its own goal. The model should write the objective itself based on the user's explicit request. If any non-closed goal exists, this returns the existing goal as either reused or conflicting and must not be retried. While the session is in Plan mode, the goal is recorded as paused and execution requires the user to switch to Build mode.",
       input: v2ObjectSchema({
-        objective: {
-          type: "string",
-          minLength: 1,
-          maxLength: maxObjectiveChars(),
-          description: "The model-formulated concrete objective to start pursuing."
-        },
+        objective: v2GoalTextSchema(services.maxObjectiveChars, "The model-formulated concrete objective to start pursuing."),
         token_budget: { type: ["integer", "null"], minimum: 1, description: "Optional positive token budget." },
         max_auto_turns: { type: ["integer", "null"], minimum: 1, description: "Optional per-goal auto-continue limit." },
         max_duration_seconds: { type: ["integer", "null"], minimum: 1, description: "Optional per-goal duration limit." }
@@ -3138,7 +3145,7 @@ function goalToolsV2(services) {
       name: "update_goal_objective",
       description: "Edit the current OpenCode goal objective when the user explicitly asks to edit or replace it.",
       input: v2ObjectSchema({
-        objective: { type: "string", minLength: 1, maxLength: maxObjectiveChars(), description: "The updated concrete objective." },
+        objective: v2GoalTextSchema(services.maxObjectiveChars, "The updated concrete objective."),
         status: { type: "string", enum: ["active", "paused"], description: "Whether the edited goal should be active or paused." }
       }, ["objective"]),
       options: { codemode: false },
@@ -3155,22 +3162,12 @@ function goalToolsV2(services) {
           enum: ["complete", "unmet"],
           description: "Required. complete means achieved; unmet means blocked or impossible."
         },
-        evidence: {
-          type: "string",
-          minLength: 1,
-          maxLength: maxObjectiveChars(),
-          description: "Required when status is complete. Summarize the concrete evidence verified."
-        },
-        blocker: {
-          type: "string",
-          minLength: 1,
-          maxLength: maxObjectiveChars(),
-          description: "Required when status is unmet. Explain the concrete blocker or impossibility."
-        }
+        evidence: v2GoalTextSchema(services.maxObjectiveChars, "Required when status is complete. Summarize the concrete evidence verified."),
+        blocker: v2GoalTextSchema(services.maxObjectiveChars, "Required when status is unmet. Explain the concrete blocker or impossibility.")
       }, ["status"]),
       options: { codemode: false },
       execute: async (args, toolContext) => ({
-        content: await closeGoalFromTool(args, toolContext)
+        content: await closeGoalFromTool(args, toolContext, services)
       })
     },
     {

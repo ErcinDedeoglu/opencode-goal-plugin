@@ -168,6 +168,13 @@ function goalTool(mock: MockContext, name: string) {
   return tool
 }
 
+function v2TextMax(mock: MockContext, toolName: string, field: string) {
+  const input = goalTool(mock, toolName).input as {
+    properties?: Record<string, { maxLength?: number }>
+  }
+  return input.properties?.[field]?.maxLength
+}
+
 function contentOf(result: unknown) {
   const value = result as { content?: string }
   return typeof value.content === "string" ? value.content : String(result)
@@ -316,9 +323,63 @@ test("V2 setup registers the /goal command via command transform", async () => {
   expect(command?.template).toContain("$ARGUMENTS")
   expect(command?.template).toContain("call get_goal first")
   expect(command?.template).toContain("never call it again")
+  expect(command?.template).toContain("faithful representation")
+  expect(command?.template).toContain("do NOT compress, truncate")
 
   mock.stream.end()
   await cleanup()
+})
+
+test("max_objective_chars is advertised and enforced per V2 instance", async () => {
+  const wide = makeMockContext({ auto_continue: false, max_objective_chars: 100 })
+  const narrow = makeMockContext({ auto_continue: false, max_objective_chars: 10 })
+  const defaulted = makeMockContext({ auto_continue: false })
+  const wideCleanup = await setupPlugin(wide as never)
+  const narrowCleanup = await setupPlugin(narrow as never)
+  const defaultCleanup = await setupPlugin(defaulted as never)
+
+  expect(v2TextMax(wide, "create_goal", "objective")).toBe(100)
+  expect(v2TextMax(narrow, "create_goal", "objective")).toBe(10)
+  expect(v2TextMax(defaulted, "create_goal", "objective")).toBe(100_000)
+  expect(v2TextMax(wide, "set_goal", "objective")).toBe(100)
+  expect(v2TextMax(wide, "update_goal_objective", "objective")).toBe(100)
+  expect(v2TextMax(wide, "update_goal", "evidence")).toBe(100)
+  expect(v2TextMax(wide, "update_goal", "blocker")).toBe(100)
+
+  const created = await goalTool(wide, "create_goal").execute(
+    { objective: "x".repeat(11) },
+    toolContext("ses_wide"),
+  )
+  expect(contentOf(created)).toContain('"status": "active"')
+  await expect(
+    goalTool(narrow, "create_goal").execute({ objective: "x".repeat(11) }, toolContext("ses_narrow")),
+  ).rejects.toThrow("at most 10 characters")
+
+  const emoji = await goalTool(wide, "create_goal").execute({ objective: "😀" }, toolContext("ses_emoji"))
+  expect(contentOf(emoji)).toContain('"objective": "😀"')
+  const trimmed = await goalTool(wide, "create_goal").execute({ objective: "  y  " }, toolContext("ses_trim"))
+  expect(contentOf(trimmed)).toContain('"objective": "y"')
+  await expect(
+    goalTool(defaulted, "create_goal").execute({ objective: "x".repeat(100_001) }, toolContext("ses_default")),
+  ).rejects.toThrow("at most 100000 characters")
+
+  await goalTool(wide, "create_goal").execute({ objective: "close me" }, toolContext("ses_close"))
+  await expect(
+    goalTool(wide, "update_goal").execute(
+      { status: "complete", evidence: "x".repeat(101) },
+      toolContext("ses_close"),
+    ),
+  ).rejects.toThrow("at most 100 characters")
+  await expect(
+    goalTool(wide, "update_goal").execute({ status: "unmet", blocker: "x".repeat(101) }, toolContext("ses_close")),
+  ).rejects.toThrow("at most 100 characters")
+
+  wide.stream.end()
+  narrow.stream.end()
+  defaulted.stream.end()
+  await wideCleanup()
+  await narrowCleanup()
+  await defaultCleanup()
 })
 
 test("V2 setup skips command registration when register_command is false", async () => {
