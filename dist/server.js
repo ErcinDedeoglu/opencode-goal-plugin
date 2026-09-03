@@ -2963,11 +2963,21 @@ async function setupV2(context) {
   }
   if (registerCommand) {
     registrations.push(await context.command.transform((draft) => {
-      if (draft.get(commandName))
-        return;
-      draft.update(commandName, (command) => {
-        command.description = "Set or view the long-running session goal";
-        command.template = goalCommandTemplate(commandName);
+      draft.add({
+        name: commandName,
+        description: "Set or view the long-running session goal",
+        execute: async (input) => {
+          const stripMention = ({ mention: _mention, ...attachment }) => attachment;
+          await context.session.prompt({
+            ...input.prompt,
+            files: input.prompt.files?.map(stripMention),
+            agents: input.prompt.agents?.map(stripMention),
+            skills: input.prompt.skills?.map(stripMention),
+            sessionID: input.sessionID,
+            text: goalCommandTemplate(commandName).replaceAll("$ARGUMENTS", () => input.prompt.text.trim()),
+            delivery: input.delivery
+          });
+        }
       });
     }));
   }
