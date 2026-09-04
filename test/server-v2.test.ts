@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test"
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import plugin from "../src/server"
@@ -27,9 +27,24 @@ type ToolDraft = {
   }): void
 }
 
+type MockMention = { start: number; end: number; text: string }
+type MockPrompt = {
+  text: string
+  files?: Array<{ uri: string; mention?: MockMention }>
+  agents?: Array<{ name: string; mention?: MockMention }>
+  skills?: Array<{ id: string; mention?: MockMention }>
+}
+
 type MockCommandDraft = {
-  get(name: string): { name: string; template: string } | undefined
-  update(name: string, update: (command: { description?: string; template: string }) => void): void
+  add(command: {
+    name: string
+    description?: string
+    execute: (input: {
+      sessionID: string
+      prompt: MockPrompt
+      delivery: "steer" | "queue"
+    }) => Promise<void>
+  }): void
 }
 
 type Registration = { dispose: () => Promise<void> }
@@ -66,14 +81,18 @@ function controlledStream() {
 
 type MockContext = {
   options: Record<string, unknown>
-  promptCalls: Array<{ sessionID: string; text: string; agents?: Array<{ name: string }> }>
+  promptCalls: Array<{
+    sessionID: string
+    delivery?: "steer" | "queue"
+  } & MockPrompt>
   tools: Array<ToolDraft["add"] extends (tool: infer T) => void ? T : never>
-  commandDraft: MockCommandDraft
+  commands: Array<MockCommandDraft["add"] extends (command: infer T) => void ? T : never>
   hooks: Record<string, (input: unknown) => void>
   systemParts: Array<{ type: string; text: string }>
   stream: ReturnType<typeof controlledStream>
   disposals: string[]
   command: {
+    list: () => Promise<{ data: Array<{ name: string }> }>
     transform: (callback: (draft: MockCommandDraft) => void) => Promise<Registration>
   }
   tool: {
@@ -82,27 +101,23 @@ type MockContext = {
   }
   session: {
     hook: (name: string, callback: (input: unknown) => void) => Promise<Registration>
-    prompt: (input: { sessionID: string; text: string; agents?: Array<{ name: string }> }) => Promise<unknown>
+    prompt: (input: {
+      sessionID: string
+      delivery?: "steer" | "queue"
+    } & MockPrompt) => Promise<unknown>
   }
   event: {
     subscribe: (options?: { signal?: AbortSignal }) => AsyncIterable<unknown>
   }
 }
 
-function makeMockContext(options: Record<string, unknown> = {}): MockContext {
+function makeMockContext(options: Record<string, unknown> = {}, existingCommands: string[] = []): MockContext {
   const tools: MockContext["tools"] = []
+  const commands: MockContext["commands"] = []
   const hooks: MockContext["hooks"] = {}
   const promptCalls: MockContext["promptCalls"] = []
   const disposals: string[] = []
   const stream = controlledStream()
-  const commandDraft: MockCommandDraft = {
-    get: () => undefined,
-    update: (name, update) => {
-      const command = { name, template: "" }
-      update(command)
-      commandDraft.get = () => command
-    },
-  }
   const registration = (name: string): Registration => ({
     dispose: async () => {
       disposals.push(name)
@@ -112,14 +127,15 @@ function makeMockContext(options: Record<string, unknown> = {}): MockContext {
     options,
     promptCalls,
     tools,
-    commandDraft,
+    commands,
     hooks,
     systemParts: [],
     stream,
     disposals,
     command: {
+      list: async () => ({ data: existingCommands.map((name) => ({ name })) }),
       transform: async (callback) => {
-        callback(commandDraft)
+        callback({ add: (command) => commands.push(command) })
         return registration("command.transform")
       },
     },
@@ -168,11 +184,11 @@ function goalTool(mock: MockContext, name: string) {
   return tool
 }
 
-function v2TextMax(mock: MockContext, toolName: string, field: string) {
+function v2TextSchema(mock: MockContext, toolName: string, field: string) {
   const input = goalTool(mock, toolName).input as {
-    properties?: Record<string, { maxLength?: number }>
+    properties?: Record<string, { maxLength?: number; pattern?: string }>
   }
-  return input.properties?.[field]?.maxLength
+  return input.properties?.[field]
 }
 
 function contentOf(result: unknown) {
@@ -282,6 +298,7 @@ test("V2 create_goal recovers from a zero-filled state file", async () => {
 
   expect(contentOf(created)).toContain('"objective": "recover V2 state"')
   expect((await getGoal("ses_v2"))?.objective).toBe("recover V2 state")
+  expect((await readdir(dir)).filter((name) => name.startsWith("goals.json.corrupt-"))).toHaveLength(1)
   mock.stream.end()
   await cleanup()
 })
@@ -313,18 +330,188 @@ test("V2 create_goal reuses the same active objective without reinitializing sta
   await cleanup()
 })
 
-test("V2 setup registers the /goal command via command transform", async () => {
+test("V2 setup registers /goal, /pause_goal, and /resume_goal via command transform", async () => {
   const mock = makeMockContext({ auto_continue: false })
   const cleanup = await setupPlugin(mock as never)
 
-  const command = mock.commandDraft.get("goal")
+  const command = mock.commands.find((candidate) => candidate.name === "goal")
+  const pause = mock.commands.find((candidate) => candidate.name === "pause_goal")
+  const resume = mock.commands.find((candidate) => candidate.name === "resume_goal")
+  expect(mock.commands.map((candidate) => candidate.name).sort()).toEqual(["goal", "pause_goal", "resume_goal"])
   expect(command).toBeDefined()
-  expect(command?.template).toContain('OpenCode goal mode command "/goal" was invoked')
-  expect(command?.template).toContain("$ARGUMENTS")
-  expect(command?.template).toContain("call get_goal first")
-  expect(command?.template).toContain("never call it again")
-  expect(command?.template).toContain("faithful representation")
-  expect(command?.template).toContain("do NOT compress, truncate")
+  expect(command?.description).toBe("Set or view the long-running session goal")
+
+  await command?.execute({
+    sessionID: "ses_command",
+    prompt: {
+      text: "ship $& and $ARGUMENTS",
+      files: [{ uri: "file:///tmp/context.txt", mention: { start: 5, end: 7, text: "$&" } }],
+      agents: [{ name: "build", mention: { start: 5, end: 7, text: "$&" } }],
+      skills: [{ id: "review", mention: { start: 5, end: 7, text: "$&" } }],
+    },
+    delivery: "queue",
+  })
+  expect(mock.promptCalls).toHaveLength(1)
+  expect(mock.promptCalls[0]).toMatchObject({
+    sessionID: "ses_command",
+    delivery: "queue",
+  })
+  expect(mock.promptCalls[0]?.files).toEqual([{ uri: "file:///tmp/context.txt" }])
+  expect(mock.promptCalls[0]?.agents).toEqual([{ name: "build" }])
+  expect(mock.promptCalls[0]?.skills).toEqual([{ id: "review" }])
+  expect(mock.promptCalls[0]?.text).toContain('OpenCode goal mode command "/goal" was invoked')
+  expect(mock.promptCalls[0]?.text).toContain("ship $& and $ARGUMENTS")
+  expect(mock.promptCalls[0]?.text).toContain("call get_goal first")
+  expect(mock.promptCalls[0]?.text).toContain("never call it again")
+  expect(mock.promptCalls[0]?.text).toContain("faithful representation")
+  expect(mock.promptCalls[0]?.text).toContain("do NOT compress, truncate")
+  expect(mock.promptCalls[0]?.text.match(/\$ARGUMENTS/g)).toHaveLength(1)
+
+  await command?.execute({ sessionID: "ses_empty", prompt: { text: "" }, delivery: "steer" })
+  expect(mock.promptCalls[1]).toMatchObject({ sessionID: "ses_empty", delivery: "steer" })
+  expect(mock.promptCalls[1]?.text).toContain("If the arguments are empty, call get_goal")
+
+  await pause?.execute({
+    sessionID: "ses_pause",
+    prompt: { text: "ignored text", agents: [{ name: "build", mention: { start: 0, end: 7, text: "ignored" } }] },
+    delivery: "steer",
+  })
+  expect(mock.promptCalls[2]).toMatchObject({
+    sessionID: "ses_pause",
+    delivery: "steer",
+  })
+  expect(mock.promptCalls[2]?.agents).toBeUndefined()
+  expect(mock.promptCalls[2]?.text).toContain('command "/pause_goal" was invoked')
+  expect(mock.promptCalls[2]?.text).toContain('update_goal_status with status "paused"')
+  expect(mock.promptCalls[2]?.text).not.toContain("ignored text")
+
+  await resume?.execute({ sessionID: "ses_resume", prompt: { text: "ignored" }, delivery: "queue" })
+  expect(mock.promptCalls[3]).toMatchObject({ sessionID: "ses_resume", delivery: "queue" })
+  expect(mock.promptCalls[3]?.text).toContain('command "/resume_goal" was invoked')
+  expect(mock.promptCalls[3]?.text).toContain('update_goal_status with status "active"')
+  expect(mock.promptCalls[3]?.text).toContain("Plan mode")
+  expect(mock.promptCalls[3]?.text).not.toContain("ignored")
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 setup preserves existing commands and configured command-name collisions", async () => {
+  const mock = makeMockContext({ auto_continue: false, command_name: "pause_goal" }, ["resume_goal"])
+  const cleanup = await setupPlugin(mock as never)
+
+  expect(mock.commands.map((command) => command.name)).toEqual(["goal", "pause_goal"])
+  expect(mock.commands[0]?.description).toBe("Set or view the long-running session goal")
+  expect(mock.commands[1]?.description).toBe("Pause the current long-running session goal")
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 prompt hook pauses compatibility commands before admission", async () => {
+  const mock = makeMockContext({ auto_continue: false }, ["goal", "pause_goal", "resume_goal"])
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "pause before acknowledgement")
+  const v1 = await plugin.server({ client: { session: { promptAsync: async () => {} } } } as never, {
+    auto_continue: false,
+  })
+  const config = {} as { command?: Record<string, { template: string }> }
+  await v1.config?.(config as never)
+  const pauseTemplate = config.command?.pause_goal?.template
+  const resumeTemplate = config.command?.resume_goal?.template
+  if (!pauseTemplate) throw new Error("expected pause_goal compatibility command")
+  if (!resumeTemplate) throw new Error("expected resume_goal compatibility command")
+  await v1.dispose?.()
+  const input = {
+    sessionID: "ses_v2",
+    messageID: "msg_pause",
+    prompt: {
+      text: `${pauseTemplate}\nuntrusted arguments`,
+      files: [{ uri: "file:///tmp/untrusted.txt" }],
+      agents: [{ name: "plan" }],
+      skills: [{ id: "untrusted" }],
+    },
+    delivery: "steer",
+  }
+
+  await mock.hooks.prompt?.(input)
+
+  expect(await getGoal("ses_v2")).toMatchObject({ status: "paused", objective: "pause before acknowledgement" })
+  expect(input.prompt.text).toBe(pauseTemplate)
+  expect(input.prompt.files).toBeUndefined()
+  expect(input.prompt.agents).toBeUndefined()
+  expect(input.prompt.skills).toBeUndefined()
+
+  const resumeInput = {
+    sessionID: "ses_v2",
+    messageID: "msg_resume",
+    prompt: {
+      text: `${resumeTemplate}\nuntrusted arguments`,
+      files: [{ uri: "file:///tmp/untrusted.txt" }],
+    },
+    delivery: "steer",
+  }
+  await mock.hooks.prompt?.(resumeInput)
+  expect((await getGoal("ses_v2"))?.status).toBe("paused")
+  expect(resumeInput.prompt.text).toBe(resumeTemplate)
+  expect(resumeInput.prompt.files).toBeUndefined()
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 command transform remains stable when the registry replays it", async () => {
+  const mock = makeMockContext({ auto_continue: false })
+  let transform: ((draft: MockCommandDraft) => void) | undefined
+  mock.command.transform = async (callback) => {
+    transform = callback
+    callback({ add: (command) => mock.commands.push(command) })
+    return {
+      dispose: async () => {
+        mock.disposals.push("command.transform")
+      },
+    }
+  }
+  const cleanup = await setupPlugin(mock as never)
+  expect(mock.commands.map((command) => command.name).sort()).toEqual(["goal", "pause_goal", "resume_goal"])
+
+  mock.commands.length = 0
+  transform?.({ add: (command) => mock.commands.push(command) })
+
+  expect(mock.commands.map((command) => command.name).sort()).toEqual(["goal", "pause_goal", "resume_goal"])
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 pause_goal persists the pause before prompting and ignores attachments", async () => {
+  const mock = makeMockContext({ auto_continue: false })
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "wait for remote guidance")
+  let statusAtPrompt: string | undefined
+  mock.session.prompt = async (input) => {
+    statusAtPrompt = (await getGoal(input.sessionID))?.status
+    mock.promptCalls.push(input)
+    return { id: "pending_pause" }
+  }
+  const pause = mock.commands.find((command) => command.name === "pause_goal")
+
+  await pause?.execute({
+    sessionID: "ses_v2",
+    prompt: {
+      text: "replace the goal",
+      files: [{ uri: "file:///tmp/untrusted.txt" }],
+      agents: [{ name: "plan" }],
+      skills: [{ id: "untrusted" }],
+    },
+    delivery: "steer",
+  })
+
+  expect(statusAtPrompt).toBe("paused")
+  expect(await getGoal("ses_v2")).toMatchObject({ status: "paused", objective: "wait for remote guidance" })
+  expect(mock.promptCalls[0]).toMatchObject({ sessionID: "ses_v2", delivery: "steer" })
+  expect(mock.promptCalls[0]?.files).toBeUndefined()
+  expect(mock.promptCalls[0]?.agents).toBeUndefined()
+  expect(mock.promptCalls[0]?.skills).toBeUndefined()
+  expect(mock.promptCalls[0]?.text).not.toContain("replace the goal")
 
   mock.stream.end()
   await cleanup()
@@ -338,13 +525,13 @@ test("max_objective_chars is advertised and enforced per V2 instance", async () 
   const narrowCleanup = await setupPlugin(narrow as never)
   const defaultCleanup = await setupPlugin(defaulted as never)
 
-  expect(v2TextMax(wide, "create_goal", "objective")).toBe(100)
-  expect(v2TextMax(narrow, "create_goal", "objective")).toBe(10)
-  expect(v2TextMax(defaulted, "create_goal", "objective")).toBe(100_000)
-  expect(v2TextMax(wide, "set_goal", "objective")).toBe(100)
-  expect(v2TextMax(wide, "update_goal_objective", "objective")).toBe(100)
-  expect(v2TextMax(wide, "update_goal", "evidence")).toBe(100)
-  expect(v2TextMax(wide, "update_goal", "blocker")).toBe(100)
+  expect(v2TextSchema(wide, "create_goal", "objective")).toMatchObject({ maxLength: 100, pattern: "\\S" })
+  expect(v2TextSchema(narrow, "create_goal", "objective")).toMatchObject({ maxLength: 10, pattern: "\\S" })
+  expect(v2TextSchema(defaulted, "create_goal", "objective")).toMatchObject({ maxLength: 100_000, pattern: "\\S" })
+  expect(v2TextSchema(wide, "set_goal", "objective")).toMatchObject({ maxLength: 100, pattern: "\\S" })
+  expect(v2TextSchema(wide, "update_goal_objective", "objective")).toMatchObject({ maxLength: 100, pattern: "\\S" })
+  expect(v2TextSchema(wide, "update_goal", "evidence")).toMatchObject({ maxLength: 100, pattern: "\\S" })
+  expect(v2TextSchema(wide, "update_goal", "blocker")).toMatchObject({ maxLength: 100, pattern: "\\S" })
 
   const created = await goalTool(wide, "create_goal").execute(
     { objective: "x".repeat(11) },
@@ -353,6 +540,9 @@ test("max_objective_chars is advertised and enforced per V2 instance", async () 
   expect(contentOf(created)).toContain('"status": "active"')
   await expect(
     goalTool(narrow, "create_goal").execute({ objective: "x".repeat(11) }, toolContext("ses_narrow")),
+  ).rejects.toThrow("at most 10 characters")
+  await expect(
+    goalTool(narrow, "create_goal").execute({ objective: " xxxxxxxxxx " }, toolContext("ses_spaced")),
   ).rejects.toThrow("at most 10 characters")
 
   const emoji = await goalTool(wide, "create_goal").execute({ objective: "😀" }, toolContext("ses_emoji"))
@@ -386,8 +576,9 @@ test("V2 setup skips command registration when register_command is false", async
   const mock = makeMockContext({ auto_continue: false, register_command: false })
   const cleanup = await setupPlugin(mock as never)
 
-  expect(mock.commandDraft.get("goal")).toBeUndefined()
+  expect(mock.commands).toHaveLength(0)
   expect(mock.disposals).not.toContain("command.transform")
+  expect(mock.hooks.prompt).toBeUndefined()
 
   mock.stream.end()
   await cleanup()
@@ -623,6 +814,22 @@ test("V2 idle event triggers auto-continue via ctx.session.prompt", async () => 
   await cleanup()
 })
 
+test("V2 JSON-encoded idle event triggers auto-continue", async () => {
+  const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0, max_auto_turns: 5 })
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "auto-continue from encoded idle events")
+
+  mock.stream.push("not JSON")
+  mock.stream.push(JSON.stringify({ type: "session.idle", created: Date.now(), data: { sessionID: "ses_v2" } }))
+
+  await waitFor(() => mock.promptCalls.length === 1)
+  expect(mock.promptCalls[0]?.sessionID).toBe("ses_v2")
+  expect((await getGoal("ses_v2"))?.autoTurns).toBe(1)
+
+  mock.stream.end()
+  await cleanup()
+})
+
 test("V2 idle continuation waits for a running child session", async () => {
   const mock = makeMockContext({ min_continue_interval_seconds: 1 })
   const cleanup = await setupPlugin(mock as never)
@@ -666,7 +873,14 @@ test("V2 cleanup disposes registrations and stops the event consumer", async () 
   await cleanup()
 
   expect(mock.disposals).toEqual(
-    expect.arrayContaining(["command.transform", "tool.transform", "tool.hook:execute.before", "tool.hook:execute.after", "session.hook:context"]),
+    expect.arrayContaining([
+      "command.transform",
+      "session.hook:prompt",
+      "tool.transform",
+      "tool.hook:execute.before",
+      "tool.hook:execute.after",
+      "session.hook:context",
+    ]),
   )
   // Events pushed after cleanup must not throw or mutate state.
   mock.stream.push({

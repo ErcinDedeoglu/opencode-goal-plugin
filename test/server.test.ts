@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, setSystemTime, test } from "bun:test"
+import { afterEach, beforeEach, expect, setSystemTime, spyOn, test } from "bun:test"
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
@@ -34,9 +34,8 @@ function argSchema(args: ToolArgs["args"], key: string) {
   return schema
 }
 
-function advertisedMax(schema: z.ZodType) {
-  const json = z.toJSONSchema(schema) as { maxLength?: number }
-  return json.maxLength
+function advertisedText(schema: z.ZodType) {
+  return z.toJSONSchema(schema) as { maxLength?: number; pattern?: string }
 }
 
 async function waitFor(predicate: () => boolean) {
@@ -225,19 +224,23 @@ test("max_objective_chars is advertised and enforced per V1 instance", async () 
 
   const wideObjective = argSchema(wideCreate.args, "objective")
   const narrowObjective = argSchema(narrowCreate.args, "objective")
-  expect(advertisedMax(wideObjective)).toBe(100)
-  expect(advertisedMax(narrowObjective)).toBe(10)
-  expect(advertisedMax(argSchema(defaultCreate.args, "objective"))).toBe(100_000)
-  expect(advertisedMax(argSchema(wideSet.args, "objective"))).toBe(100)
-  expect(advertisedMax(argSchema(wideEdit.args, "objective"))).toBe(100)
-  expect(advertisedMax(argSchema(wideUpdate.args, "evidence"))).toBe(100)
-  expect(advertisedMax(argSchema(wideUpdate.args, "blocker"))).toBe(100)
+  expect(advertisedText(wideObjective)).toMatchObject({ maxLength: 100, pattern: "\\S" })
+  expect(advertisedText(narrowObjective)).toMatchObject({ maxLength: 10, pattern: "\\S" })
+  expect(advertisedText(argSchema(defaultCreate.args, "objective"))).toMatchObject({
+    maxLength: 100_000,
+    pattern: "\\S",
+  })
+  expect(advertisedText(argSchema(wideSet.args, "objective"))).toMatchObject({ maxLength: 100, pattern: "\\S" })
+  expect(advertisedText(argSchema(wideEdit.args, "objective"))).toMatchObject({ maxLength: 100, pattern: "\\S" })
+  expect(advertisedText(argSchema(wideUpdate.args, "evidence"))).toMatchObject({ maxLength: 100, pattern: "\\S" })
+  expect(advertisedText(argSchema(wideUpdate.args, "blocker"))).toMatchObject({ maxLength: 100, pattern: "\\S" })
 
   expect(wideObjective.safeParse("😀").success).toBe(true)
   expect(wideObjective.safeParse(" a ").success).toBe(true)
   expect(wideObjective.safeParse("   ").success).toBe(false)
   expect(wideObjective.safeParse("x".repeat(101)).success).toBe(false)
   expect(narrowObjective.safeParse("x".repeat(11)).success).toBe(false)
+  expect(narrowObjective.safeParse(" xxxxxxxxxx ").success).toBe(false)
 
   const wideContext = { sessionID: "ses_wide" } as never
   const narrowContext = { sessionID: "ses_narrow" } as never
@@ -322,7 +325,7 @@ test("duplicate limited goals retain the safety stop notice", async () => {
   expect(String(duplicate)).toContain("Safety limit reached")
 })
 
-test("server plugin registers goal as a desktop/web command by default", async () => {
+test("server plugin registers goal, pause_goal, and resume_goal as desktop/web commands by default", async () => {
   const hooks = await setupServer(
     {
       client: {
@@ -352,6 +355,17 @@ test("server plugin registers goal as a desktop/web command by default", async (
   expect(config.command?.goal?.template).toContain("never call it again")
   expect(config.command?.goal?.template).toContain("faithful representation")
   expect(config.command?.goal?.template).toContain("do NOT compress, truncate")
+  expect(config.command?.pause_goal?.description).toBe("Pause the current long-running session goal")
+  expect(config.command?.pause_goal?.template).toContain('command "/pause_goal" was invoked')
+  expect(config.command?.pause_goal?.template).toContain('update_goal_status with status "paused"')
+  expect(config.command?.pause_goal?.template).toContain("Do not create, resume, or continue")
+  expect(config.command?.pause_goal?.template).not.toContain("$ARGUMENTS")
+  expect(config.command?.resume_goal?.description).toBe("Resume the current long-running session goal")
+  expect(config.command?.resume_goal?.template).toContain('command "/resume_goal" was invoked')
+  expect(config.command?.resume_goal?.template).toContain('update_goal_status with status "active"')
+  expect(config.command?.resume_goal?.template).toContain("must not reopen it")
+  expect(config.command?.resume_goal?.template).toContain("Plan mode")
+  expect(config.command?.resume_goal?.template).not.toContain("$ARGUMENTS")
 })
 
 test("system transform is byte-stable across the complete goal lifecycle", async () => {
@@ -614,7 +628,7 @@ test("goal status tool pauses and resumes a goal", async () => {
   expect(String(resumed)).toContain('"lastStatus": "Goal resumed."')
 })
 
-test("server plugin does not overwrite an existing goal command", async () => {
+test("server plugin does not overwrite existing goal commands", async () => {
   const hooks = await setupServer(
     {
       client: {
@@ -631,6 +645,14 @@ test("server plugin does not overwrite an existing goal command", async () => {
         description: "custom",
         template: "custom template",
       },
+      pause_goal: {
+        description: "custom pause",
+        template: "custom pause template",
+      },
+      resume_goal: {
+        description: "custom resume",
+        template: "custom resume template",
+      },
     },
   }
 
@@ -638,6 +660,148 @@ test("server plugin does not overwrite an existing goal command", async () => {
 
   expect(config.command.goal.description).toBe("custom")
   expect(config.command.goal.template).toBe("custom template")
+  expect(config.command.pause_goal.description).toBe("custom pause")
+  expect(config.command.pause_goal.template).toBe("custom pause template")
+  expect(config.command.resume_goal.description).toBe("custom resume")
+  expect(config.command.resume_goal.template).toBe("custom resume template")
+})
+
+test("a configured command-name collision preserves all standalone commands", async () => {
+  const hooks = await setupServer(
+    { client: { session: { promptAsync: async () => {} } } } as never,
+    { auto_continue: false, command_name: "pause_goal" },
+  )
+  const config = {} as {
+    command?: Record<string, { description?: string; template: string }>
+  }
+
+  await hooks.config?.(config as never)
+
+  expect(Object.keys(config.command ?? {}).sort()).toEqual(["goal", "pause_goal", "resume_goal"])
+  expect(config.command?.goal?.description).toBe("Set or view the long-running session goal")
+  expect(config.command?.goal?.template).toContain('OpenCode goal mode command "/goal" was invoked')
+  expect(config.command?.pause_goal?.description).toBe("Pause the current long-running session goal")
+})
+
+test("pause_goal persists the pause before its acknowledgement turn", async () => {
+  const hooks = await setupServer(
+    { client: { session: { promptAsync: async () => {} } } } as never,
+    { auto_continue: false },
+  )
+  const config = {} as { command?: Record<string, { template: string }> }
+  await hooks.config?.(config as never)
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+  await requireTool(tools.create_goal, "create_goal").execute(
+    { objective: "wait for remote guidance" },
+    { sessionID: "ses_pause", agent: "build" } as never,
+  )
+
+  const output = {
+    parts: [
+      {
+        id: "part_text",
+        sessionID: "ses_pause",
+        messageID: "msg_pause",
+        type: "text",
+        text: `${config.command?.pause_goal?.template}\nuntrusted arguments`,
+      },
+      {
+        id: "part_file",
+        sessionID: "ses_pause",
+        messageID: "msg_pause",
+        type: "file",
+        mime: "text/plain",
+        url: "file:///tmp/untrusted.txt",
+      },
+    ],
+  }
+  await hooks["command.execute.before"]?.(
+    { command: "pause_goal", sessionID: "ses_pause", arguments: "ignored" },
+    output as never,
+  )
+
+  expect((await getGoal("ses_pause"))?.status).toBe("paused")
+  expect(output.parts).toHaveLength(1)
+  expect(output.parts[0]?.text).toBe(config.command?.pause_goal?.template)
+})
+
+test("an existing pause_goal command is not intercepted", async () => {
+  const hooks = await setupServer(
+    { client: { session: { promptAsync: async () => {} } } } as never,
+    { auto_continue: false },
+  )
+  await hooks.config?.({ command: { pause_goal: { template: "custom" } } } as never)
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+  await requireTool(tools.create_goal, "create_goal").execute(
+    { objective: "keep running" },
+    { sessionID: "ses_custom_pause", agent: "build" } as never,
+  )
+
+  await hooks["command.execute.before"]?.(
+    { command: "pause_goal", sessionID: "ses_custom_pause", arguments: "" },
+    {
+      parts: [
+        {
+          id: "part_custom",
+          sessionID: "ses_custom_pause",
+          messageID: "msg_custom",
+          type: "text",
+          text: "custom",
+        },
+      ],
+    } as never,
+  )
+
+  expect((await getGoal("ses_custom_pause"))?.status).toBe("active")
+})
+
+test("resume_goal strips rendered arguments and attachments without bypassing the status tool", async () => {
+  const hooks = await setupServer(
+    { client: { session: { promptAsync: async () => {} } } } as never,
+    { auto_continue: false },
+  )
+  const config = {} as { command?: Record<string, { template: string }> }
+  await hooks.config?.(config as never)
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+  await requireTool(tools.create_goal, "create_goal").execute(
+    { objective: "resume only through the tool" },
+    { sessionID: "ses_resume", agent: "build" } as never,
+  )
+  await requireTool(tools.update_goal_status, "update_goal_status").execute(
+    { status: "paused" },
+    { sessionID: "ses_resume", agent: "build" } as never,
+  )
+  const output = {
+    parts: [
+      {
+        id: "part_resume",
+        sessionID: "ses_resume",
+        messageID: "msg_resume",
+        type: "text",
+        text: `${config.command?.resume_goal?.template}\nuntrusted arguments`,
+      },
+      {
+        id: "part_resume_file",
+        sessionID: "ses_resume",
+        messageID: "msg_resume",
+        type: "file",
+        mime: "text/plain",
+        url: "file:///tmp/untrusted.txt",
+      },
+    ],
+  }
+
+  await hooks["command.execute.before"]?.(
+    { command: "resume_goal", sessionID: "ses_resume", arguments: "ignored" },
+    output as never,
+  )
+
+  expect((await getGoal("ses_resume"))?.status).toBe("paused")
+  expect(output.parts).toHaveLength(1)
+  expect(output.parts[0]?.text).toBe(config.command?.resume_goal?.template)
 })
 
 test("server plugin can disable desktop/web command registration", async () => {
@@ -779,6 +943,153 @@ test("per-prompt chat hook recovers from an empty state file", async () => {
   await hooks["chat.message"]!({ sessionID: "ses_1", agent: "build" } as never, { message: {} } as never)
 
   expect(JSON.parse(await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8"))).toEqual({ version: 1, goals: {} })
+})
+
+test("zero-filled state recovery reports the quarantine through app logging", async () => {
+  const file = process.env.OPENCODE_GOAL_STATE_PATH!
+  await writeFile(file, "\0".repeat(28_454), "utf8")
+  const logs: unknown[] = []
+  const hooks = await setupServer(
+    {
+      client: {
+        app: { log: async (input: unknown) => logs.push(input) },
+        session: { promptAsync: async () => {} },
+      },
+    } as never,
+    { auto_continue: false },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  await requireTool(tools.create_goal, "create_goal").execute(
+    { objective: "recover with evidence" },
+    { sessionID: "ses_1", agent: "build" } as never,
+  )
+
+  await waitFor(() => logs.length === 1)
+  expect(logs[0]).toMatchObject({
+    body: {
+      service: "opencode-goal-plugin",
+      level: "error",
+      message: "Corrupt goal state quarantined before recovery",
+      extra: { stateFile: file },
+    },
+  })
+  expect(JSON.stringify(logs[0])).toContain(`${file}.corrupt-`)
+})
+
+test("state recovery reporting is scoped to the configured state path", async () => {
+  const firstLogs: unknown[] = []
+  await setupServer(
+    { client: { app: { log: async (input: unknown) => firstLogs.push(input) } } } as never,
+    { auto_continue: false },
+  )
+  const secondFile = join(dir, "other-goals.json")
+  process.env.OPENCODE_GOAL_STATE_PATH = secondFile
+  await writeFile(secondFile, "\0\0", "utf8")
+  const secondLogs: unknown[] = []
+  const second = await setupServer(
+    { client: { app: { log: async (input: unknown) => secondLogs.push(input) } } } as never,
+    { auto_continue: false },
+  )
+  const tools = second.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  await requireTool(tools.create_goal, "create_goal").execute(
+    { objective: "recover the second state" },
+    { sessionID: "ses_1", agent: "build" } as never,
+  )
+
+  await waitFor(() => secondLogs.length === 1)
+  expect(firstLogs).toEqual([])
+})
+
+test("disposing a server unregisters its state recovery reporter", async () => {
+  const staleLogs: unknown[] = []
+  const stale = await setupServer(
+    { client: { app: { log: async (input: unknown) => staleLogs.push(input) } } } as never,
+    { auto_continue: false },
+  )
+  await stale.dispose?.()
+  const activeLogs: unknown[] = []
+  const active = await setupServer(
+    { client: { app: { log: async (input: unknown) => activeLogs.push(input) } } } as never,
+    { auto_continue: false },
+  )
+  await writeFile(process.env.OPENCODE_GOAL_STATE_PATH!, "\0\0", "utf8")
+  const tools = active.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  await requireTool(tools.create_goal, "create_goal").execute(
+    { objective: "recover after reload" },
+    { sessionID: "ses_1", agent: "build" } as never,
+  )
+
+  await waitFor(() => activeLogs.length === 1)
+  expect(staleLogs).toEqual([])
+})
+
+test("application logging failures do not block state recovery", async () => {
+  await writeFile(process.env.OPENCODE_GOAL_STATE_PATH!, "\0\0", "utf8")
+  const errors: string[] = []
+  const error = spyOn(console, "error").mockImplementation((...args) => errors.push(args.map(String).join(" ")))
+  const hooks = await setupServer(
+    {
+      client: {
+        app: { log: async () => Promise.reject(new Error("logger unavailable")) },
+      },
+    } as never,
+    { auto_continue: false },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  try {
+    await requireTool(tools.create_goal, "create_goal").execute(
+      { objective: "recover without logger" },
+      { sessionID: "ses_1", agent: "build" } as never,
+    )
+    await waitFor(() => errors.length === 1)
+  } finally {
+    error.mockRestore()
+  }
+
+  expect((await getGoal("ses_1"))?.objective).toBe("recover without logger")
+  expect(errors[0]).toContain("Failed to report quarantined state")
+})
+
+test("quarantine write failures are reported without blocking recovery", async () => {
+  const file = join(dir, "g".repeat(170))
+  process.env.OPENCODE_GOAL_STATE_PATH = file
+  await writeFile(file, "\0\0", "utf8")
+  const logs: unknown[] = []
+  const errors: string[] = []
+  const error = spyOn(console, "error").mockImplementation((...args) => errors.push(args.map(String).join(" ")))
+  const hooks = await setupServer(
+    { client: { app: { log: async (input: unknown) => logs.push(input) } } } as never,
+    { auto_continue: false },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  try {
+    await requireTool(tools.create_goal, "create_goal").execute(
+      { objective: "recover after quarantine failure" },
+      { sessionID: "ses_1", agent: "build" } as never,
+    )
+    await waitFor(() => logs.length === 1)
+  } finally {
+    error.mockRestore()
+  }
+
+  expect((await getGoal("ses_1"))?.objective).toBe("recover after quarantine failure")
+  expect(logs[0]).toMatchObject({
+    body: {
+      message: "Corrupt goal state could not be quarantined; continuing recovery",
+      extra: { stateFile: file, outcome: "quarantineFailed" },
+    },
+  })
+  expect(errors.some((message) => message.includes("Could not quarantine corrupt state"))).toBe(true)
 })
 
 test("message transform records assistant checkpoints", async () => {

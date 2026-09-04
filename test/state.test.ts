@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, setSystemTime, spyOn, test } from "bun:test"
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
+import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import {
@@ -56,6 +56,36 @@ test("creates, reads, pauses, resumes, completes, and clears a goal", async () =
   expect(completed.completionEvidence).toBe("tests passed")
   expect(await clearGoal("ses_1")).toBe(true)
   expect(await getGoal("ses_1")).toBeNull()
+})
+
+test("status transitions are idempotent and cannot reopen closed goals", async () => {
+  await createGoal("ses_1", "ship safely", null)
+  const active = await getGoal("ses_1")
+  await setGoalStatus("ses_1", "active")
+  expect((await getGoal("ses_1"))?.history).toEqual(active?.history)
+
+  await setGoalStatus("ses_1", "paused")
+  const paused = await getGoal("ses_1")
+  await setGoalStatus("ses_1", "paused")
+  expect((await getGoal("ses_1"))?.history).toEqual(paused?.history)
+
+  await completeGoal("ses_1", "verified")
+  await expect(setGoalStatus("ses_1", "active")).rejects.toThrow("goal is closed")
+  expect((await getGoal("ses_1"))?.status).toBe("complete")
+})
+
+test("pausing an already limited goal preserves its safety status", async () => {
+  await createGoal("ses_limited", "stay bounded", 1)
+  await accountUsage("ses_limited", 2)
+  const limited = await getGoal("ses_limited")
+
+  await setGoalStatus("ses_limited", "paused")
+
+  expect(await getGoal("ses_limited")).toMatchObject({
+    status: "budgetLimited",
+    lastStatus: limited?.lastStatus,
+    history: limited?.history,
+  })
 })
 
 test("a mutation writes back to the state path it read", async () => {
@@ -139,13 +169,15 @@ test("requires evidence when closing goals", async () => {
   await expect(markGoalUnmet("ses_1", "")).rejects.toThrow("blocker must not be empty")
 })
 
-test("objective and evidence limits use trimmed Unicode code points per call", async () => {
+test("objective and evidence limits use submitted Unicode code points per call", async () => {
   expect(validateObjective("😀", 1)).toBe("😀")
-  expect(validateObjective(" a ", 1)).toBe("a")
-  expect(() => validateObjective("   ", 1)).toThrow("must not be empty")
+  expect(validateObjective(" a ", 3)).toBe("a")
+  expect(() => validateObjective(" a ", 1)).toThrow("at most 1 characters")
+  expect(() => validateObjective(" ", 1)).toThrow("must not be empty")
+  expect(() => validateObjective("   ", 3)).toThrow("must not be empty")
   expect(() => validateObjective("ab", 1)).toThrow("at most 1 characters")
   expect(() => validateEvidence("😀😀", "blocker", 1)).toThrow("blocker must be at most 1 characters")
-  expect(validateEvidence(" ok ", "completion evidence", 2)).toBe("ok")
+  expect(validateEvidence(" ok ", "completion evidence", 4)).toBe("ok")
 
   const created = await createGoal("ses_limit", "😀", { maxObjectiveChars: 1 })
   expect(created.objective).toBe("😀")
@@ -525,6 +557,7 @@ test("does not overwrite corrupt persisted state", async () => {
   await expect(createGoal("ses_1", "ship the plugin", null)).rejects.toThrow()
 
   expect(await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8")).toBe("{not valid json")
+  expect((await readdir(dir)).filter((name) => name.includes(".corrupt-"))).toEqual([])
 })
 
 test("treats empty and zero-filled state files as missing for async and sync reads", async () => {
@@ -535,6 +568,7 @@ test("treats empty and zero-filled state files as missing for async and sync rea
     expect(getGoalSync("ses_1")).toBeNull()
     expect(await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8")).toBe(content)
   }
+  expect(await readdir(dir)).toEqual(["goals.json"])
 })
 
 test("loads valid state prefixed by a UTF-8 BOM", async () => {
@@ -557,6 +591,35 @@ test("creates and persists a goal from an empty state file", async () => {
     version: 1,
     goals: { ses_1: { objective: "recover safely" } },
   })
+  expect((await readdir(dir)).filter((name) => name.includes(".corrupt-"))).toEqual([])
+})
+
+test("quarantines a non-empty zero-filled state before replacing it", async () => {
+  const file = process.env.OPENCODE_GOAL_STATE_PATH!
+  const damaged = "\0".repeat(28_454)
+  await writeFile(file, damaged, "utf8")
+
+  const created = await createGoal("ses_1", "recover safely", null)
+
+  expect(created.objective).toBe("recover safely")
+  expect((await getGoal("ses_1"))?.objective).toBe("recover safely")
+  const quarantines = (await readdir(dir)).filter((name) => name.startsWith("goals.json.corrupt-"))
+  expect(quarantines).toHaveLength(1)
+  expect(await readFile(join(dir, quarantines[0]!), "utf8")).toBe(damaged)
+})
+
+test("quarantines non-empty whitespace and BOM-only state before replacing it", async () => {
+  for (const [index, damaged] of [" \n\t", "\uFEFF"].entries()) {
+    const file = join(dir, `goals-${index}.json`)
+    process.env.OPENCODE_GOAL_STATE_PATH = file
+    await writeFile(file, damaged, "utf8")
+
+    await createGoal(`ses_${index}`, "recover padded state", null)
+
+    const quarantines = (await readdir(dir)).filter((name) => name.startsWith(`goals-${index}.json.corrupt-`))
+    expect(quarantines).toHaveLength(1)
+    expect(await readFile(join(dir, quarantines[0]!), "utf8")).toBe(damaged)
+  }
 })
 
 test("warns once for each empty state file path", async () => {

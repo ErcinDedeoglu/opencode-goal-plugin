@@ -15,6 +15,7 @@ import {
   getGoal,
   getGoalInternal,
   markGoalUnmet,
+  onStateRecovery,
   pauseGoalForPlanMode,
   PLAN_MODE_STOP_REASON,
   recordAssistantProgress,
@@ -26,6 +27,7 @@ import {
   rollbackContinuationAttempt,
   setGoalStatus,
   resolveMaxObjectiveChars,
+  statePath,
   updateGoalObjective,
   validateEvidence,
   validateObjective,
@@ -139,6 +141,20 @@ function restrictedAgentSet(options?: Options) {
 }
 
 function goalCommandTemplate(commandName: string) {
+  const createGuidance = [
+    "Otherwise, call get_goal first.",
+    "If it returns a non-closed goal with the same objective, do not create it again; " +
+      "continue working from the returned state.",
+    "If it returns a different non-closed goal, report that conflict instead of replacing it.",
+    "Only when there is no non-closed goal, call create_goal once.",
+    "Build the objective as a complete, faithful representation of the arguments: keep every requirement, constraint, " +
+      "scope boundary, and success criterion with no omissions or loss of meaning.",
+    "You may restructure and rephrase for clarity and coherence, but do NOT compress, truncate, or drop any content, " +
+      "and do NOT substitute the content with references or pointers to external files.",
+    "If the user includes explicit budget instructions, pass token_budget, max_auto_turns, or max_duration_seconds to " +
+      "create_goal rather than leaving those words in the objective.",
+  ].join(" ")
+
   return `OpenCode goal mode command "/${commandName}" was invoked.
 
 Arguments:
@@ -157,14 +173,73 @@ Use the goal tools to handle this command:
 - If the arguments start with "edit ", update the current goal objective by calling update_goal_objective with the remaining text.
 - If the arguments start with "complete " or "done ", perform a completion audit against real artifacts and command output. Call update_goal with status "complete" only if the goal is achieved, using concise evidence from the audit.
 - If the arguments start with "unmet ", "blocked ", or "blocker ", call update_goal with status "unmet" only when the goal cannot be achieved or needs external input, using the remaining arguments as the blocker.
-- Otherwise, call get_goal first. If it returns a non-closed goal with the same objective, do not create it again; continue working from the returned state. If it returns a different non-closed goal, report that conflict instead of replacing it. Only when there is no non-closed goal, call create_goal once. Build the objective as a complete, faithful representation of the arguments: keep every requirement, constraint, scope boundary, and success criterion with no omissions or loss of meaning. You may restructure and rephrase for clarity and coherence, but do NOT compress, truncate, or drop any content, and do NOT substitute the content with references or pointers to external files. If the user includes explicit budget instructions, pass token_budget, max_auto_turns, or max_duration_seconds to create_goal rather than leaving those words in the objective.
+- ${createGuidance}
 
 Create a goal only from these explicit command arguments. Do not infer a goal from unrelated session context. After create_goal succeeds or returns an existing matching goal, never call it again for this command; continue working from the returned goal state.`
+}
+
+function goalStatusCommandTemplate(commandName: "pause_goal" | "resume_goal") {
+  if (commandName === "pause_goal") {
+    return `OpenCode goal mode command "/pause_goal" was invoked.
+
+The command handler pauses an active goal before this acknowledgement turn when possible. Ignore any command arguments, call get_goal first, then handle only this pause request:
+
+- If there is no goal, briefly report that no goal is set.
+- If the goal is paused, do not mutate it again; briefly confirm "Goal paused."
+- If the goal is still active, call update_goal_status with status "paused" and briefly report the result.
+- If the goal is budgetLimited or usageLimited, do not mutate it; briefly report that it remains stopped by its safety limit.
+- If the goal is complete or unmet, do not mutate it; briefly report that it is closed.
+
+Do not create, resume, or continue a goal. Do not edit, clear, complete, or mark a goal unmet.`
+  }
+
+  return `OpenCode goal mode command "/resume_goal" was invoked.
+
+Ignore any command arguments. Call get_goal first, then handle only this resume request:
+
+- If there is no goal, briefly report that no goal is set.
+- If the goal is complete or unmet, do not mutate it; you must not reopen it.
+- If the goal is already active, do not mutate it; continue working toward its existing objective.
+- If the goal is paused, budgetLimited, or usageLimited, call update_goal_status with status "active", then continue working toward its existing objective.
+- If Plan mode or another restricted agent prevents resuming, report that the user must switch to Build mode instead of retrying.
+
+Do not create, edit, clear, complete, or mark a goal unmet.`
+}
+
+type GoalCommandDefinition = {
+  name: string
+  description: string
+  template: string
+  action: "goal" | "pause" | "resume"
+}
+
+function goalCommandDefinitions(commandName: string): GoalCommandDefinition[] {
+  return [
+    {
+      name: commandName,
+      description: "Set or view the long-running session goal",
+      template: goalCommandTemplate(commandName),
+      action: "goal",
+    },
+    {
+      name: "pause_goal",
+      description: "Pause the current long-running session goal",
+      template: goalStatusCommandTemplate("pause_goal"),
+      action: "pause",
+    },
+    {
+      name: "resume_goal",
+      description: "Resume the current long-running session goal",
+      template: goalStatusCommandTemplate("resume_goal"),
+      action: "resume",
+    },
+  ]
 }
 
 function commandNameFromOptions(options?: Options) {
   const name = options?.command_name?.trim() || DEFAULT_COMMAND_NAME
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) return DEFAULT_COMMAND_NAME
+  if (name.toLowerCase() === "pause_goal" || name.toLowerCase() === "resume_goal") return DEFAULT_COMMAND_NAME
   return name
 }
 
@@ -181,13 +256,24 @@ function timeoutMillisecondsFromSeconds(value: unknown) {
   return Math.min(Math.ceil(value * 1000), MAX_TIMER_DELAY_MS)
 }
 
-function registerDesktopCommand(config: Config, commandName: string) {
+function registerDesktopCommands(config: Config, commandName: string) {
   config.command ??= {}
-  if (config.command[commandName]) return
-  config.command[commandName] = {
-    description: "Set or view the long-running session goal",
-    template: goalCommandTemplate(commandName),
+  const commands = goalCommandDefinitions(commandName)
+  for (const command of commands) {
+    if (config.command[command.name]) continue
+    config.command[command.name] = {
+      description: command.description,
+      template: command.template,
+    }
   }
+}
+
+function sanitizeGoalStatusCommandParts(output: { parts: Array<{ type: string; text?: string }> }, template: string) {
+  const text = output.parts.find((part) => part.type === "text" && part.text?.startsWith(template))
+  if (!text) return false
+  text.text = template
+  output.parts.splice(0, output.parts.length, text)
+  return true
 }
 
 function textFromPart(part: unknown): string {
@@ -798,11 +884,11 @@ function boundedGoalTextSchema(limit: number, description: string, validate: (va
         })
       }
     })
-    .meta({ minLength: 1, maxLength: limit, description })
+    .meta({ minLength: 1, maxLength: limit, pattern: "\\S", description })
 }
 
 function v2GoalTextSchema(limit: number, description: string) {
-  return { type: "string" as const, minLength: 1, maxLength: limit, description }
+  return { type: "string" as const, minLength: 1, maxLength: limit, pattern: "\\S", description }
 }
 
 async function createGoalFromTool(input: CreateGoalArgs, context: ToolExecContext, services: GoalServices) {
@@ -911,6 +997,20 @@ type V2EventLike = {
   data: Record<string, unknown>
 }
 
+function decodeV2Event(value: unknown): V2EventLike | undefined {
+  let decoded = value
+  if (typeof decoded === "string") {
+    try {
+      decoded = JSON.parse(decoded)
+    } catch {
+      return undefined
+    }
+  }
+  if (!isRecord(decoded) || typeof decoded.type !== "string" || !isRecord(decoded.data)) return undefined
+  if (typeof decoded.created !== "number") return undefined
+  return decoded as V2EventLike
+}
+
 type V2StepRecord = {
   messageID: string
   agent?: string
@@ -971,6 +1071,21 @@ const server: Plugin = async ({ client }, options?: Options) => {
   const planAgents = restrictedAgentSet(options)
   const isPlanAgent = (agent: unknown) => typeof agent === "string" && planAgents.has(agent.trim().toLowerCase())
   const goalServices: GoalServices = { options: options ?? {}, isPlanAgent, maxObjectiveChars: objectiveChars }
+  const stopStateRecoveryReporting = onStateRecovery(statePath(), async ({ stateFile, quarantineFile, outcome, error }) => {
+    await client.app?.log?.({
+      body: {
+        service: "opencode-goal-plugin",
+        level: "error",
+        message:
+          outcome === "quarantined"
+            ? "Corrupt goal state quarantined before recovery"
+            : outcome === "sourceChanged"
+              ? "Goal state changed during recovery; refusing to overwrite it"
+              : "Corrupt goal state could not be quarantined; continuing recovery",
+        extra: { stateFile, quarantineFile, outcome, ...(error ? { error } : {}) },
+      },
+    })
+  })
   // Set by dispose so in-flight operations triggered before disposal cannot
   // schedule new timers or invoke continuations afterward.
   let disposed = false
@@ -1263,6 +1378,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
   return {
     async dispose() {
       disposed = true
+      stopStateRecoveryReporting()
       for (const scheduled of scheduledContinuations.values()) clearTimeout(scheduled.timer)
       scheduledContinuations.clear()
       for (const watchdog of turnWatchdogs.values()) clearTimeout(watchdog.timer)
@@ -1274,7 +1390,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
     },
     async config(config) {
       if (!registerCommand) return
-      registerDesktopCommand(config, commandName)
+      registerDesktopCommands(config, commandName)
     },
     tool: {
       get_goal: {
@@ -1391,6 +1507,16 @@ const server: Plugin = async ({ client }, options?: Options) => {
         const goal = await getGoalInternal(sessionID)
         toolAttempts.set(toolAttemptKey(sessionID, callID), goal?.pendingAttempt?.id ?? null)
       }
+    },
+    async "command.execute.before"(input, output) {
+      if (input.command !== "pause_goal" && input.command !== "resume_goal") return
+      const template = goalStatusCommandTemplate(input.command)
+      if (!sanitizeGoalStatusCommandParts(output, template)) return
+      if (input.command !== "pause_goal") return
+      const goal = await getGoal(input.sessionID)
+      if (goal?.status === "active") await setGoalStatus(input.sessionID, "paused")
+      cancelScheduledContinuation(input.sessionID)
+      clearTurnWatchdog(input.sessionID)
     },
     async "tool.execute.after"(input, output) {
       taskTracker.noteTaskOutput(
@@ -2122,13 +2248,64 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   }
 
   if (registerCommand) {
+    const existingCommands = new Set((await context.command.list()).data.map((command) => command.name))
     registrations.push(
       await context.command.transform((draft) => {
-        if (draft.get(commandName)) return
-        draft.update(commandName, (command) => {
-          command.description = "Set or view the long-running session goal"
-          command.template = goalCommandTemplate(commandName)
-        })
+        const claimedCommands = new Set(existingCommands)
+        for (const command of goalCommandDefinitions(commandName)) {
+          if (claimedCommands.has(command.name)) continue
+          claimedCommands.add(command.name)
+          draft.add({
+            name: command.name,
+            description: command.description,
+            execute: async (input) => {
+              if (command.action === "pause") {
+                const goal = await getGoal(input.sessionID)
+                if (goal?.status === "active") await setGoalStatus(input.sessionID, "paused")
+                cancelScheduledContinuation(input.sessionID)
+                clearTurnWatchdog(input.sessionID)
+              }
+              const stripMention = <T extends { mention?: unknown }>({ mention: _mention, ...attachment }: T) => attachment
+              await context.session.prompt({
+                ...(command.action === "goal"
+                  ? {
+                      ...input.prompt,
+                      files: input.prompt.files?.map(stripMention),
+                      agents: input.prompt.agents?.map(stripMention),
+                      skills: input.prompt.skills?.map(stripMention),
+                    }
+                  : {}),
+                sessionID: input.sessionID,
+                text: command.template.replaceAll("$ARGUMENTS", () => input.prompt.text.trim()),
+                delivery: input.delivery,
+              })
+            },
+          })
+        }
+      }),
+    )
+
+    // V1-compatible config commands bypass V2 command executors, so enforce
+    // their lifecycle action again at the shared prompt-admission boundary.
+    registrations.push(
+      await context.session.hook("prompt", async (input) => {
+        const pauseTemplate = goalStatusCommandTemplate("pause_goal")
+        const resumeTemplate = goalStatusCommandTemplate("resume_goal")
+        const template = input.prompt.text.startsWith(pauseTemplate)
+          ? pauseTemplate
+          : input.prompt.text.startsWith(resumeTemplate)
+            ? resumeTemplate
+            : null
+        if (!template) return
+        input.prompt.text = template
+        delete input.prompt.files
+        delete input.prompt.agents
+        delete input.prompt.skills
+        if (template !== pauseTemplate) return
+        const goal = await getGoal(input.sessionID)
+        if (goal?.status === "active") await setGoalStatus(input.sessionID, "paused")
+        cancelScheduledContinuation(input.sessionID)
+        clearTurnWatchdog(input.sessionID)
       }),
     )
   }
@@ -2203,7 +2380,8 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       while (true) {
         const { done, value } = await iterator.next()
         if (done) break
-        await handleV2Event(value as V2EventLike)
+        const event = decodeV2Event(value)
+        if (event) await handleV2Event(event)
       }
     } catch (error) {
       if (!abortController.signal.aborted) v2ErrorLog("V2 event consumer stopped", error)

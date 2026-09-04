@@ -3,6 +3,7 @@
 import { z } from "zod";
 
 // src/state.ts
+import { randomUUID as randomUUID2 } from "crypto";
 import { mkdir, readFile } from "fs/promises";
 import { homedir } from "os";
 import { dirname as dirname2, join } from "path";
@@ -220,6 +221,23 @@ function mutableState(state) {
   return JSON.parse(JSON.stringify(state));
 }
 var warnedEmptyStatePaths = new Set;
+var stateRecoveryListeners = new Set;
+function onStateRecovery(stateFile, report) {
+  const listener = { stateFile, report };
+  stateRecoveryListeners.add(listener);
+  return () => stateRecoveryListeners.delete(listener);
+}
+function notifyStateRecovery(notice) {
+  for (const listener of stateRecoveryListeners) {
+    if (listener.stateFile !== notice.stateFile)
+      continue;
+    Promise.resolve().then(() => listener.report(notice)).catch((error) => {
+      try {
+        console.error(`[opencode-goal-plugin] Failed to report quarantined state at ${notice.quarantineFile}:`, error instanceof Error ? error.message : String(error));
+      } catch {}
+    });
+  }
+}
 function isStatePadding(character) {
   return character === "\x00" || character.trim() === "";
 }
@@ -232,24 +250,53 @@ function parseStateText(raw, file) {
     end -= 1;
   const content = raw.slice(start, end);
   if (content)
-    return JSON.parse(content);
+    return { value: JSON.parse(content), recoveryContent: null };
   if (!warnedEmptyStatePaths.has(file)) {
     warnedEmptyStatePaths.add(file);
     console.warn(`[opencode-goal-plugin] Empty or zero-filled state file at ${file}; recovering with empty state.`);
   }
-  return emptyState();
+  return { value: emptyState(), recoveryContent: raw || null };
 }
 function decodeState(value) {
   return Schema.decodeUnknown(StateSchema)(value).pipe(Effect.map(mutableState), Effect.map(normalizeState), Effect.mapError((cause) => new StateDecodeError({ cause })));
 }
-function readStateEffect(file = statePath()) {
+function readStateResultEffect(file = statePath()) {
   return Effect.tryPromise({
     try: () => readFile(file, "utf8"),
     catch: (cause) => new StateReadError({ cause })
   }).pipe(Effect.flatMap((raw) => Effect.try({
     try: () => parseStateText(raw, file),
     catch: (cause) => new StateDecodeError({ cause })
-  })), Effect.flatMap(decodeState), Effect.catchAll((error) => error._tag === "StateReadError" && isMissingStateFile(error.cause) ? Effect.succeed(emptyState()) : Effect.fail(error)));
+  })), Effect.flatMap(({ value, recoveryContent }) => decodeState(value).pipe(Effect.map((state) => ({ state, recoveryContent })))), Effect.catchAll((error) => error._tag === "StateReadError" && isMissingStateFile(error.cause) ? Effect.succeed({ state: emptyState(), recoveryContent: null }) : Effect.fail(error)));
+}
+function readStateEffect(file = statePath()) {
+  return readStateResultEffect(file).pipe(Effect.map(({ state }) => state));
+}
+function quarantineStateEffect(file, content) {
+  return Effect.promise(async () => {
+    const quarantineFile = `${file}.corrupt-${Date.now()}-${randomUUID2()}`;
+    try {
+      await mkdir(dirname2(file), { recursive: true, mode: 448 });
+      await atomicWriteFile(quarantineFile, content);
+      return { quarantineFile, error: null };
+    } catch (error) {
+      return { quarantineFile, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+}
+function verifyRecoverySourceEffect(file, expectedContent, quarantineFile) {
+  return Effect.promise(async () => {
+    try {
+      return await readFile(file, "utf8") === expectedContent;
+    } catch (error) {
+      if (!isMissingStateFile(error)) {
+        try {
+          console.error(`[opencode-goal-plugin] Could not re-read ${file} after preserving it at ${quarantineFile}; continuing recovery:`, error instanceof Error ? error.message : String(error));
+        } catch {}
+      }
+      return true;
+    }
+  });
 }
 function writeStateEffect(state, file = statePath()) {
   return Effect.tryPromise({
@@ -278,11 +325,46 @@ async function mutate(fn) {
   return enqueueMutation(() => {
     const file = statePath();
     return Effect.runPromise(Effect.gen(function* () {
-      const state = yield* readStateEffect(file);
+      const { state, recoveryContent } = yield* readStateResultEffect(file);
       const result = yield* Effect.tryPromise({
         try: () => Promise.resolve(fn(state)),
         catch: (cause) => cause instanceof Error ? cause : new Error(String(cause))
       });
+      if (recoveryContent != null) {
+        const quarantine = yield* quarantineStateEffect(file, recoveryContent);
+        if (quarantine.error != null) {
+          const notice = {
+            stateFile: file,
+            quarantineFile: quarantine.quarantineFile,
+            outcome: "quarantineFailed",
+            error: quarantine.error
+          };
+          try {
+            console.error(`[opencode-goal-plugin] Could not quarantine corrupt state at ${file}; continuing recovery:`, quarantine.error);
+          } catch {}
+          notifyStateRecovery(notice);
+        } else {
+          const unchanged = yield* verifyRecoverySourceEffect(file, recoveryContent, quarantine.quarantineFile);
+          if (!unchanged) {
+            const message = "goal state changed while recovery was being quarantined; refusing to overwrite it";
+            notifyStateRecovery({
+              stateFile: file,
+              quarantineFile: quarantine.quarantineFile,
+              outcome: "sourceChanged",
+              error: message
+            });
+            return yield* Effect.fail(new StateWriteError({ cause: new Error(message) }));
+          }
+          try {
+            console.warn(`[opencode-goal-plugin] Preserved corrupt state from ${file} at ${quarantine.quarantineFile}; continuing recovery.`);
+          } catch {}
+          notifyStateRecovery({
+            stateFile: file,
+            quarantineFile: quarantine.quarantineFile,
+            outcome: "quarantined"
+          });
+        }
+      }
       yield* writeStateEffect(state, file);
       return result;
     }));
@@ -293,11 +375,11 @@ function resolveMaxObjectiveChars(value) {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : DEFAULT_MAX_OBJECTIVE_CHARS;
 }
 function boundedText(value, limit, label) {
+  if ([...value].length > limit)
+    throw new Error(`${label} must be at most ${limit} characters`);
   const trimmed = value.trim();
   if (!trimmed)
     throw new Error(`${label} must not be empty`);
-  if ([...trimmed].length > limit)
-    throw new Error(`${label} must be at most ${limit} characters`);
   return trimmed;
 }
 function validateObjective(objective, limit = DEFAULT_MAX_OBJECTIVE_CHARS) {
@@ -613,6 +695,12 @@ async function setGoalStatus(sessionID, status, agent) {
     const goal = state.goals[sessionID];
     if (!goal)
       throw new Error("cannot update goal because this session has no goal");
+    if (isClosed(goal.status))
+      throw new Error("cannot update goal status because this goal is closed");
+    if (goal.status === status)
+      return snapshot(goal);
+    if (status === "paused" && goal.status !== "active")
+      return snapshot(goal);
     accountWallClock(goal);
     goal.status = status;
     goal.updatedAt = nowSeconds();
@@ -1186,6 +1274,15 @@ function restrictedAgentSet(options) {
   return new Set(names.map((name) => typeof name === "string" ? name.trim().toLowerCase() : "").filter(Boolean));
 }
 function goalCommandTemplate(commandName) {
+  const createGuidance = [
+    "Otherwise, call get_goal first.",
+    "If it returns a non-closed goal with the same objective, do not create it again; " + "continue working from the returned state.",
+    "If it returns a different non-closed goal, report that conflict instead of replacing it.",
+    "Only when there is no non-closed goal, call create_goal once.",
+    "Build the objective as a complete, faithful representation of the arguments: keep every requirement, constraint, " + "scope boundary, and success criterion with no omissions or loss of meaning.",
+    "You may restructure and rephrase for clarity and coherence, but do NOT compress, truncate, or drop any content, " + "and do NOT substitute the content with references or pointers to external files.",
+    "If the user includes explicit budget instructions, pass token_budget, max_auto_turns, or max_duration_seconds to " + "create_goal rather than leaving those words in the objective."
+  ].join(" ");
   return `OpenCode goal mode command "/${commandName}" was invoked.
 
 Arguments:
@@ -1204,13 +1301,63 @@ Use the goal tools to handle this command:
 - If the arguments start with "edit ", update the current goal objective by calling update_goal_objective with the remaining text.
 - If the arguments start with "complete " or "done ", perform a completion audit against real artifacts and command output. Call update_goal with status "complete" only if the goal is achieved, using concise evidence from the audit.
 - If the arguments start with "unmet ", "blocked ", or "blocker ", call update_goal with status "unmet" only when the goal cannot be achieved or needs external input, using the remaining arguments as the blocker.
-- Otherwise, call get_goal first. If it returns a non-closed goal with the same objective, do not create it again; continue working from the returned state. If it returns a different non-closed goal, report that conflict instead of replacing it. Only when there is no non-closed goal, call create_goal once. Build the objective as a complete, faithful representation of the arguments: keep every requirement, constraint, scope boundary, and success criterion with no omissions or loss of meaning. You may restructure and rephrase for clarity and coherence, but do NOT compress, truncate, or drop any content, and do NOT substitute the content with references or pointers to external files. If the user includes explicit budget instructions, pass token_budget, max_auto_turns, or max_duration_seconds to create_goal rather than leaving those words in the objective.
+- ${createGuidance}
 
 Create a goal only from these explicit command arguments. Do not infer a goal from unrelated session context. After create_goal succeeds or returns an existing matching goal, never call it again for this command; continue working from the returned goal state.`;
+}
+function goalStatusCommandTemplate(commandName) {
+  if (commandName === "pause_goal") {
+    return `OpenCode goal mode command "/pause_goal" was invoked.
+
+The command handler pauses an active goal before this acknowledgement turn when possible. Ignore any command arguments, call get_goal first, then handle only this pause request:
+
+- If there is no goal, briefly report that no goal is set.
+- If the goal is paused, do not mutate it again; briefly confirm "Goal paused."
+- If the goal is still active, call update_goal_status with status "paused" and briefly report the result.
+- If the goal is budgetLimited or usageLimited, do not mutate it; briefly report that it remains stopped by its safety limit.
+- If the goal is complete or unmet, do not mutate it; briefly report that it is closed.
+
+Do not create, resume, or continue a goal. Do not edit, clear, complete, or mark a goal unmet.`;
+  }
+  return `OpenCode goal mode command "/resume_goal" was invoked.
+
+Ignore any command arguments. Call get_goal first, then handle only this resume request:
+
+- If there is no goal, briefly report that no goal is set.
+- If the goal is complete or unmet, do not mutate it; you must not reopen it.
+- If the goal is already active, do not mutate it; continue working toward its existing objective.
+- If the goal is paused, budgetLimited, or usageLimited, call update_goal_status with status "active", then continue working toward its existing objective.
+- If Plan mode or another restricted agent prevents resuming, report that the user must switch to Build mode instead of retrying.
+
+Do not create, edit, clear, complete, or mark a goal unmet.`;
+}
+function goalCommandDefinitions(commandName) {
+  return [
+    {
+      name: commandName,
+      description: "Set or view the long-running session goal",
+      template: goalCommandTemplate(commandName),
+      action: "goal"
+    },
+    {
+      name: "pause_goal",
+      description: "Pause the current long-running session goal",
+      template: goalStatusCommandTemplate("pause_goal"),
+      action: "pause"
+    },
+    {
+      name: "resume_goal",
+      description: "Resume the current long-running session goal",
+      template: goalStatusCommandTemplate("resume_goal"),
+      action: "resume"
+    }
+  ];
 }
 function commandNameFromOptions(options) {
   const name = options?.command_name?.trim() || DEFAULT_COMMAND_NAME;
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name))
+    return DEFAULT_COMMAND_NAME;
+  if (name.toLowerCase() === "pause_goal" || name.toLowerCase() === "resume_goal")
     return DEFAULT_COMMAND_NAME;
   return name;
 }
@@ -1225,14 +1372,25 @@ function timeoutMillisecondsFromSeconds(value) {
     return null;
   return Math.min(Math.ceil(value * 1000), MAX_TIMER_DELAY_MS);
 }
-function registerDesktopCommand(config, commandName) {
+function registerDesktopCommands(config, commandName) {
   config.command ??= {};
-  if (config.command[commandName])
-    return;
-  config.command[commandName] = {
-    description: "Set or view the long-running session goal",
-    template: goalCommandTemplate(commandName)
-  };
+  const commands = goalCommandDefinitions(commandName);
+  for (const command of commands) {
+    if (config.command[command.name])
+      continue;
+    config.command[command.name] = {
+      description: command.description,
+      template: command.template
+    };
+  }
+}
+function sanitizeGoalStatusCommandParts(output, template) {
+  const text = output.parts.find((part) => part.type === "text" && part.text?.startsWith(template));
+  if (!text)
+    return false;
+  text.text = template;
+  output.parts.splice(0, output.parts.length, text);
+  return true;
 }
 function textFromPart(part) {
   if (!part || typeof part !== "object")
@@ -1815,10 +1973,10 @@ function boundedGoalTextSchema(limit, description, validate) {
         message: error instanceof Error ? error.message : String(error)
       });
     }
-  }).meta({ minLength: 1, maxLength: limit, description });
+  }).meta({ minLength: 1, maxLength: limit, pattern: "\\S", description });
 }
 function v2GoalTextSchema(limit, description) {
-  return { type: "string", minLength: 1, maxLength: limit, description };
+  return { type: "string", minLength: 1, maxLength: limit, pattern: "\\S", description };
 }
 async function createGoalFromTool(input, context, services) {
   const planningOnly = services.isPlanAgent(context.agent);
@@ -1897,6 +2055,21 @@ function v2ObjectSchema(properties, required = []) {
     additionalProperties: false
   };
 }
+function decodeV2Event(value) {
+  let decoded = value;
+  if (typeof decoded === "string") {
+    try {
+      decoded = JSON.parse(decoded);
+    } catch {
+      return;
+    }
+  }
+  if (!isRecord(decoded) || typeof decoded.type !== "string" || !isRecord(decoded.data))
+    return;
+  if (typeof decoded.created !== "number")
+    return;
+  return decoded;
+}
 function textFromToolResult(result) {
   if (typeof result.output === "string")
     return result.output;
@@ -1940,6 +2113,16 @@ var server = async ({ client }, options) => {
   const planAgents = restrictedAgentSet(options);
   const isPlanAgent = (agent) => typeof agent === "string" && planAgents.has(agent.trim().toLowerCase());
   const goalServices = { options: options ?? {}, isPlanAgent, maxObjectiveChars: objectiveChars };
+  const stopStateRecoveryReporting = onStateRecovery(statePath(), async ({ stateFile, quarantineFile, outcome, error }) => {
+    await client.app?.log?.({
+      body: {
+        service: "opencode-goal-plugin",
+        level: "error",
+        message: outcome === "quarantined" ? "Corrupt goal state quarantined before recovery" : outcome === "sourceChanged" ? "Goal state changed during recovery; refusing to overwrite it" : "Corrupt goal state could not be quarantined; continuing recovery",
+        extra: { stateFile, quarantineFile, outcome, ...error ? { error } : {} }
+      }
+    });
+  });
   let disposed = false;
   async function taskBlockStatus(sessionID) {
     if (!deferWhileTasksActive)
@@ -2188,6 +2371,7 @@ var server = async ({ client }, options) => {
   return {
     async dispose() {
       disposed = true;
+      stopStateRecoveryReporting();
       for (const scheduled of scheduledContinuations.values())
         clearTimeout(scheduled.timer);
       scheduledContinuations.clear();
@@ -2202,7 +2386,7 @@ var server = async ({ client }, options) => {
     async config(config) {
       if (!registerCommand)
         return;
-      registerDesktopCommand(config, commandName);
+      registerDesktopCommands(config, commandName);
     },
     tool: {
       get_goal: {
@@ -2297,6 +2481,20 @@ var server = async ({ client }, options) => {
         const goal = await getGoalInternal(sessionID);
         toolAttempts.set(toolAttemptKey(sessionID, callID), goal?.pendingAttempt?.id ?? null);
       }
+    },
+    async "command.execute.before"(input, output) {
+      if (input.command !== "pause_goal" && input.command !== "resume_goal")
+        return;
+      const template = goalStatusCommandTemplate(input.command);
+      if (!sanitizeGoalStatusCommandParts(output, template))
+        return;
+      if (input.command !== "pause_goal")
+        return;
+      const goal = await getGoal(input.sessionID);
+      if (goal?.status === "active")
+        await setGoalStatus(input.sessionID, "paused");
+      cancelScheduledContinuation(input.sessionID);
+      clearTurnWatchdog(input.sessionID);
     },
     async "tool.execute.after"(input, output) {
       taskTracker.noteTaskOutput(input, output);
@@ -2987,13 +3185,57 @@ async function setupV2(context) {
     }
   }
   if (registerCommand) {
+    const existingCommands = new Set((await context.command.list()).data.map((command) => command.name));
     registrations.push(await context.command.transform((draft) => {
-      if (draft.get(commandName))
+      const claimedCommands = new Set(existingCommands);
+      for (const command of goalCommandDefinitions(commandName)) {
+        if (claimedCommands.has(command.name))
+          continue;
+        claimedCommands.add(command.name);
+        draft.add({
+          name: command.name,
+          description: command.description,
+          execute: async (input) => {
+            if (command.action === "pause") {
+              const goal = await getGoal(input.sessionID);
+              if (goal?.status === "active")
+                await setGoalStatus(input.sessionID, "paused");
+              cancelScheduledContinuation(input.sessionID);
+              clearTurnWatchdog(input.sessionID);
+            }
+            const stripMention = ({ mention: _mention, ...attachment }) => attachment;
+            await context.session.prompt({
+              ...command.action === "goal" ? {
+                ...input.prompt,
+                files: input.prompt.files?.map(stripMention),
+                agents: input.prompt.agents?.map(stripMention),
+                skills: input.prompt.skills?.map(stripMention)
+              } : {},
+              sessionID: input.sessionID,
+              text: command.template.replaceAll("$ARGUMENTS", () => input.prompt.text.trim()),
+              delivery: input.delivery
+            });
+          }
+        });
+      }
+    }));
+    registrations.push(await context.session.hook("prompt", async (input) => {
+      const pauseTemplate = goalStatusCommandTemplate("pause_goal");
+      const resumeTemplate = goalStatusCommandTemplate("resume_goal");
+      const template = input.prompt.text.startsWith(pauseTemplate) ? pauseTemplate : input.prompt.text.startsWith(resumeTemplate) ? resumeTemplate : null;
+      if (!template)
         return;
-      draft.update(commandName, (command) => {
-        command.description = "Set or view the long-running session goal";
-        command.template = goalCommandTemplate(commandName);
-      });
+      input.prompt.text = template;
+      delete input.prompt.files;
+      delete input.prompt.agents;
+      delete input.prompt.skills;
+      if (template !== pauseTemplate)
+        return;
+      const goal = await getGoal(input.sessionID);
+      if (goal?.status === "active")
+        await setGoalStatus(input.sessionID, "paused");
+      cancelScheduledContinuation(input.sessionID);
+      clearTurnWatchdog(input.sessionID);
     }));
   }
   registrations.push(await context.tool.transform((draft) => {
@@ -3056,7 +3298,9 @@ async function setupV2(context) {
         const { done, value } = await iterator.next();
         if (done)
           break;
-        await handleV2Event(value);
+        const event = decodeV2Event(value);
+        if (event)
+          await handleV2Event(event);
       }
     } catch (error) {
       if (!abortController.signal.aborted)
