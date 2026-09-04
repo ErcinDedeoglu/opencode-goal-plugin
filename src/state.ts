@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto"
 import { readFileSync } from "node:fs"
 import { mkdir, readFile } from "node:fs/promises"
 import { homedir } from "node:os"
@@ -290,12 +291,47 @@ function mutableState(state: Schema.Schema.Type<typeof StateSchema>): State {
 }
 
 const warnedEmptyStatePaths = new Set<string>()
+export type StateRecoveryNotice = {
+  stateFile: string
+  quarantineFile: string
+  outcome: "quarantined" | "quarantineFailed" | "sourceChanged"
+  error?: string
+}
+type StateRecoveryListener = {
+  stateFile: string
+  report: (notice: StateRecoveryNotice) => Promise<void> | void
+}
+const stateRecoveryListeners = new Set<StateRecoveryListener>()
+
+export function onStateRecovery(stateFile: string, report: StateRecoveryListener["report"]) {
+  const listener = { stateFile, report }
+  stateRecoveryListeners.add(listener)
+  return () => stateRecoveryListeners.delete(listener)
+}
+
+function notifyStateRecovery(notice: StateRecoveryNotice) {
+  for (const listener of stateRecoveryListeners) {
+    if (listener.stateFile !== notice.stateFile) continue
+    void Promise.resolve()
+      .then(() => listener.report(notice))
+      .catch((error) => {
+        try {
+          console.error(
+            `[opencode-goal-plugin] Failed to report quarantined state at ${notice.quarantineFile}:`,
+            error instanceof Error ? error.message : String(error),
+          )
+        } catch {
+          // Reporting must never block state recovery.
+        }
+      })
+  }
+}
 
 function isStatePadding(character: string) {
   return character === "\0" || character.trim() === ""
 }
 
-function parseStateText(raw: string, file: string): unknown {
+function parseStateText(raw: string, file: string) {
   // trim handles whitespace and UTF-8 BOMs. NUL padding can remain after an
   // interrupted filesystem write, so tolerate it only at the file boundaries.
   let start = 0
@@ -303,13 +339,13 @@ function parseStateText(raw: string, file: string): unknown {
   while (start < end && isStatePadding(raw[start]!)) start += 1
   while (end > start && isStatePadding(raw[end - 1]!)) end -= 1
   const content = raw.slice(start, end)
-  if (content) return JSON.parse(content) as unknown
+  if (content) return { value: JSON.parse(content) as unknown, recoveryContent: null }
 
   if (!warnedEmptyStatePaths.has(file)) {
     warnedEmptyStatePaths.add(file)
     console.warn(`[opencode-goal-plugin] Empty or zero-filled state file at ${file}; recovering with empty state.`)
   }
-  return emptyState()
+  return { value: emptyState(), recoveryContent: raw || null }
 }
 
 function decodeState(value: unknown) {
@@ -320,7 +356,7 @@ function decodeState(value: unknown) {
   )
 }
 
-function readStateEffect(file = statePath()) {
+function readStateResultEffect(file = statePath()) {
   return Effect.tryPromise({
     try: () => readFile(file, "utf8"),
     catch: (cause) => new StateReadError({ cause }),
@@ -331,11 +367,52 @@ function readStateEffect(file = statePath()) {
         catch: (cause) => new StateDecodeError({ cause }),
       }),
     ),
-    Effect.flatMap(decodeState),
+    Effect.flatMap(({ value, recoveryContent }) =>
+      decodeState(value).pipe(Effect.map((state) => ({ state, recoveryContent }))),
+    ),
     Effect.catchAll((error) =>
-      error._tag === "StateReadError" && isMissingStateFile(error.cause) ? Effect.succeed(emptyState()) : Effect.fail(error),
+      error._tag === "StateReadError" && isMissingStateFile(error.cause)
+        ? Effect.succeed({ state: emptyState(), recoveryContent: null })
+        : Effect.fail(error),
     ),
   )
+}
+
+function readStateEffect(file = statePath()) {
+  return readStateResultEffect(file).pipe(Effect.map(({ state }) => state))
+}
+
+function quarantineStateEffect(file: string, content: string) {
+  return Effect.promise(async () => {
+    const quarantineFile = `${file}.corrupt-${Date.now()}-${randomUUID()}`
+    try {
+      await mkdir(dirname(file), { recursive: true, mode: 0o700 })
+      await atomicWriteFile(quarantineFile, content)
+      return { quarantineFile, error: null }
+    } catch (error) {
+      return { quarantineFile, error: error instanceof Error ? error.message : String(error) }
+    }
+  })
+}
+
+function verifyRecoverySourceEffect(file: string, expectedContent: string, quarantineFile: string) {
+  return Effect.promise(async () => {
+    try {
+      return (await readFile(file, "utf8")) === expectedContent
+    } catch (error) {
+      if (!isMissingStateFile(error)) {
+        try {
+          console.error(
+            `[opencode-goal-plugin] Could not re-read ${file} after preserving it at ${quarantineFile}; continuing recovery:`,
+            error instanceof Error ? error.message : String(error),
+          )
+        } catch {
+          // Diagnostics must never block state recovery.
+        }
+      }
+      return true
+    }
+  })
 }
 
 function writeStateEffect(state: State, file = statePath()) {
@@ -366,7 +443,7 @@ function readStateSync(): State {
   try {
     const file = statePath()
     const raw = readFileSync(file, "utf8")
-    return normalizeState(mutableState(Schema.decodeUnknownSync(StateSchema)(parseStateText(raw, file))))
+    return normalizeState(mutableState(Schema.decodeUnknownSync(StateSchema)(parseStateText(raw, file).value)))
   } catch (error) {
     if (isMissingStateFile(error)) return emptyState()
     throw error
@@ -389,11 +466,55 @@ async function mutate<T>(fn: (state: State) => T | Promise<T>) {
     const file = statePath()
     return Effect.runPromise(
       Effect.gen(function* () {
-        const state = yield* readStateEffect(file)
+        const { state, recoveryContent } = yield* readStateResultEffect(file)
         const result = yield* Effect.tryPromise({
           try: () => Promise.resolve(fn(state)),
           catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
         })
+        if (recoveryContent != null) {
+          const quarantine = yield* quarantineStateEffect(file, recoveryContent)
+          if (quarantine.error != null) {
+            const notice: StateRecoveryNotice = {
+              stateFile: file,
+              quarantineFile: quarantine.quarantineFile,
+              outcome: "quarantineFailed",
+              error: quarantine.error,
+            }
+            try {
+              console.error(
+                `[opencode-goal-plugin] Could not quarantine corrupt state at ${file}; continuing recovery:`,
+                quarantine.error,
+              )
+            } catch {
+              // Diagnostics must never block state recovery.
+            }
+            notifyStateRecovery(notice)
+          } else {
+            const unchanged = yield* verifyRecoverySourceEffect(file, recoveryContent, quarantine.quarantineFile)
+            if (!unchanged) {
+              const message = "goal state changed while recovery was being quarantined; refusing to overwrite it"
+              notifyStateRecovery({
+                stateFile: file,
+                quarantineFile: quarantine.quarantineFile,
+                outcome: "sourceChanged",
+                error: message,
+              })
+              return yield* Effect.fail(new StateWriteError({ cause: new Error(message) }))
+            }
+            try {
+              console.warn(
+                `[opencode-goal-plugin] Preserved corrupt state from ${file} at ${quarantine.quarantineFile}; continuing recovery.`,
+              )
+            } catch {
+              // Diagnostics must never block state recovery.
+            }
+            notifyStateRecovery({
+              stateFile: file,
+              quarantineFile: quarantine.quarantineFile,
+              outcome: "quarantined",
+            })
+          }
+        }
         yield* writeStateEffect(state, file)
         return result
       }),
