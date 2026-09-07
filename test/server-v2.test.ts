@@ -371,6 +371,9 @@ test("V2 setup registers /goal, /pause_goal, and /resume_goal via command transf
 
   await command?.execute({ sessionID: "ses_empty", prompt: { text: "" }, delivery: "steer" })
   expect(mock.promptCalls[1]).toMatchObject({ sessionID: "ses_empty", delivery: "steer" })
+  expect(Object.hasOwn(mock.promptCalls[1]!, "files")).toBe(false)
+  expect(Object.hasOwn(mock.promptCalls[1]!, "agents")).toBe(false)
+  expect(Object.hasOwn(mock.promptCalls[1]!, "skills")).toBe(false)
   expect(mock.promptCalls[1]?.text).toContain("If the arguments are empty, call get_goal")
 
   await pause?.execute({
@@ -405,6 +408,44 @@ test("V2 setup preserves existing commands and configured command-name collision
   expect(mock.commands.map((command) => command.name)).toEqual(["goal", "pause_goal"])
   expect(mock.commands[0]?.description).toBe("Set or view the long-running session goal")
   expect(mock.commands[1]?.description).toBe("Pause the current long-running session goal")
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 goal command omits undefined prompt fields and preserves empty attachment arrays", async () => {
+  const mock = makeMockContext({ auto_continue: false })
+  const cleanup = await setupPlugin(mock as never)
+  const command = mock.commands.find((candidate) => candidate.name === "goal")
+
+  await command?.execute({
+    sessionID: "ses_undefined_attachments",
+    prompt: {
+      text: "",
+      files: undefined,
+      agents: undefined,
+      skills: undefined,
+      futureOptionalField: undefined,
+      futureDefinedField: "kept",
+    } as MockPrompt & { futureOptionalField?: string; futureDefinedField?: string },
+    delivery: "queue",
+  })
+
+  expect(mock.promptCalls).toHaveLength(1)
+  expect(Object.hasOwn(mock.promptCalls[0]!, "files")).toBe(false)
+  expect(Object.hasOwn(mock.promptCalls[0]!, "agents")).toBe(false)
+  expect(Object.hasOwn(mock.promptCalls[0]!, "skills")).toBe(false)
+  expect(Object.hasOwn(mock.promptCalls[0]!, "futureOptionalField")).toBe(false)
+  expect((mock.promptCalls[0] as MockPrompt & { futureDefinedField?: string }).futureDefinedField).toBe("kept")
+
+  await command?.execute({
+    sessionID: "ses_empty_attachments",
+    prompt: { text: "", files: [], agents: [], skills: [] },
+    delivery: "queue",
+  })
+  expect(mock.promptCalls[1]?.files).toEqual([])
+  expect(mock.promptCalls[1]?.agents).toEqual([])
+  expect(mock.promptCalls[1]?.skills).toEqual([])
 
   mock.stream.end()
   await cleanup()

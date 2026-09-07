@@ -143,7 +143,6 @@ try {
   assert(commands.data.some((command) => command.name === "goal"))
   await api(`/api/session/${sessionID}/command`, {
     command: "goal", text: "Create a goal for the fixture milestone. Keep it active until the automatic continuation arrives.",
-    files: [], agents: [], skills: [],
   })
   let state: { goals: Record<string, { status: string; autoTurns: number }> } | undefined
   await waitFor(async () => {
@@ -160,6 +159,23 @@ try {
   })
   assert.equal(state!.goals[sessionID]!.autoTurns, 2)
   assert(continuationCalls > 0)
+  const arraysSession = await api("/api/session", {
+    location: { directory: project },
+    title: "Isolated command arrays smoke",
+    model: { providerID: "fixture", id: "fixture" },
+    agent: "build",
+  }) as { data: { id: string } }
+  await api(`/api/session/${arraysSession.data.id}/command`, {
+    command: "goal",
+    text: "Create a goal for the arrays-present command smoke.",
+    files: [],
+    agents: [],
+    skills: [],
+  })
+  await waitFor(async () => {
+    try { state = JSON.parse(await readFile(env.OPENCODE_GOAL_STATE_PATH, "utf8")) } catch { return false }
+    return state?.goals[arraysSession.data.id] != null
+  })
   console.log(JSON.stringify({ result: "PASS", packagePath, sessionID, modelCalls, continuationCalls, status: state!.goals[sessionID]!.status, autoTurns: state!.goals[sessionID]!.autoTurns, artifacts: root }, null, 2))
 } finally {
   child.kill()

@@ -1353,6 +1353,9 @@ function goalCommandDefinitions(commandName) {
     }
   ];
 }
+function omitUndefined(value) {
+  return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined));
+}
 function commandNameFromOptions(options) {
   const name = options?.command_name?.trim() || DEFAULT_COMMAND_NAME;
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name))
@@ -3256,14 +3259,19 @@ async function setupV2(context) {
               cancelScheduledContinuation(input.sessionID);
               clearTurnWatchdog(input.sessionID);
             }
-            const stripMention = ({ mention: _mention, ...attachment }) => attachment;
+            let forwardedPrompt = {};
+            if (command.action === "goal") {
+              const stripMention = ({ mention: _mention, ...attachment }) => attachment;
+              const { files, agents, skills, ...promptFields } = input.prompt;
+              forwardedPrompt = {
+                ...omitUndefined(promptFields),
+                ...files ? { files: files.map(stripMention) } : {},
+                ...agents ? { agents: agents.map(stripMention) } : {},
+                ...skills ? { skills: skills.map(stripMention) } : {}
+              };
+            }
             await context.session.prompt({
-              ...command.action === "goal" ? {
-                ...input.prompt,
-                files: input.prompt.files?.map(stripMention),
-                agents: input.prompt.agents?.map(stripMention),
-                skills: input.prompt.skills?.map(stripMention)
-              } : {},
+              ...forwardedPrompt,
               sessionID: input.sessionID,
               text: command.template.replaceAll("$ARGUMENTS", () => input.prompt.text.trim()),
               delivery: input.delivery

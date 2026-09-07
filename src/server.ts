@@ -236,6 +236,10 @@ function goalCommandDefinitions(commandName: string): GoalCommandDefinition[] {
   ]
 }
 
+function omitUndefined<T extends object>(value: T): Partial<T> {
+  return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined)) as Partial<T>
+}
+
 function commandNameFromOptions(options?: Options) {
   const name = options?.command_name?.trim() || DEFAULT_COMMAND_NAME
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) return DEFAULT_COMMAND_NAME
@@ -2337,16 +2341,19 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
                 cancelScheduledContinuation(input.sessionID)
                 clearTurnWatchdog(input.sessionID)
               }
-              const stripMention = <T extends { mention?: unknown }>({ mention: _mention, ...attachment }: T) => attachment
+              let forwardedPrompt: Partial<typeof input.prompt> = {}
+              if (command.action === "goal") {
+                const stripMention = <T extends { mention?: unknown }>({ mention: _mention, ...attachment }: T) => attachment
+                const { files, agents, skills, ...promptFields } = input.prompt
+                forwardedPrompt = {
+                  ...omitUndefined(promptFields),
+                  ...(files ? { files: files.map(stripMention) } : {}),
+                  ...(agents ? { agents: agents.map(stripMention) } : {}),
+                  ...(skills ? { skills: skills.map(stripMention) } : {}),
+                }
+              }
               await context.session.prompt({
-                ...(command.action === "goal"
-                  ? {
-                      ...input.prompt,
-                      files: input.prompt.files?.map(stripMention),
-                      agents: input.prompt.agents?.map(stripMention),
-                      skills: input.prompt.skills?.map(stripMention),
-                    }
-                  : {}),
+                ...forwardedPrompt,
                 sessionID: input.sessionID,
                 text: command.template.replaceAll("$ARGUMENTS", () => input.prompt.text.trim()),
                 delivery: input.delivery,
