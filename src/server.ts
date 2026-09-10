@@ -33,6 +33,7 @@ import {
   validateObjective,
 } from "./state"
 import { compactionContext, continuationPrompt, limitPrompt, systemReminder } from "./prompts"
+import { SessionTodoTracker } from "./session-todos"
 
 type Options = {
   auto_continue?: boolean
@@ -157,6 +158,9 @@ function goalCommandTemplate(commandName: string) {
       "and do NOT substitute the content with references or pointers to external files.",
     "If the user includes explicit budget instructions, pass token_budget, max_auto_turns, or max_duration_seconds to " +
       "create_goal rather than leaving those words in the objective.",
+    "After the goal exists, use OpenCode's todowrite tool for a short session checklist of remaining steps.",
+    "Keep todo content brief; do not paste the full objective into a todo.",
+    "Completing every todo does not complete the goal; close it only with update_goal after an evidence audit.",
   ].join(" ")
 
   return `OpenCode goal mode command "/${commandName}" was invoked.
@@ -1117,6 +1121,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
   // actually ran under. Entries are removed on execute.after, session deletion,
   // and dispose.
   const toolAttempts = new Map<string, string | null>()
+  const sessionTodos = new SessionTodoTracker(client)
   // Sessions whose busy episode already received a watchdog rescue. Cleared
   // when the episode ends (idle/deleted), so each busy episode rescues at most
   // once and a rescue prompt cannot recursively re-arm the watchdog.
@@ -1203,7 +1208,12 @@ const server: Plugin = async ({ client }, options?: Options) => {
       activeContinuations.add(sessionID)
       claimedContinuation = true
       watchdogRescuedSessions.add(sessionID)
-      await sendContinuation(client, sessionID, continuationPrompt(current), current.lastPromptAgent ?? latestTurnAgent ?? null)
+      await sendContinuation(
+        client,
+        sessionID,
+        continuationPrompt(current, await sessionTodos.resolve(sessionID)),
+        current.lastPromptAgent ?? latestTurnAgent ?? null,
+      )
       // Watchdog rescues are untracked retries: a delivered prompt arms the
       // pending-continuation window but never consumes an auto-turn budget and
       // never arms the no-progress evaluation. The rescue delivers while the
@@ -1381,10 +1391,11 @@ const server: Plugin = async ({ client }, options?: Options) => {
         await rollbackContinuationAttempt(sessionID)
         return
       }
+      const todos = await sessionTodos.resolve(sessionID)
       await sendContinuation(
         client,
         sessionID,
-        goal.status === "active" ? continuationPrompt(goal) : limitPrompt(goal),
+        goal.status === "active" ? continuationPrompt(goal, todos) : limitPrompt(goal, todos),
         goal.lastPromptAgent ?? latestTurnAgent ?? null,
       )
       if (disposed) {
@@ -1568,10 +1579,11 @@ const server: Plugin = async ({ client }, options?: Options) => {
         },
       },
     },
-    async "tool.execute.before"(input) {
+    async "tool.execute.before"(input, output) {
       taskTracker.noteTaskCall(input as { tool?: unknown; sessionID?: unknown; callID?: unknown })
       const sessionID = typeof input?.sessionID === "string" ? input.sessionID : undefined
       const callID = typeof input?.callID === "string" ? input.callID : undefined
+      sessionTodos.rememberFromTool(sessionID, input?.tool, (output as { args?: unknown } | undefined)?.args)
       if (sessionID && callID) {
         const goal = await getGoalInternal(sessionID)
         toolAttempts.set(toolAttemptKey(sessionID, callID), goal?.pendingAttempt?.id ?? null)
@@ -1598,8 +1610,10 @@ const server: Plugin = async ({ client }, options?: Options) => {
       const expectedAttemptID = attemptKey ? toolAttempts.get(attemptKey) : undefined
       if (attemptKey) toolAttempts.delete(attemptKey)
       if (!sessionID) return
+      const toolResult = output as { output?: unknown; error?: unknown; args?: unknown }
+      sessionTodos.rememberFromTool(sessionID, input?.tool, toolResult.output)
+      sessionTodos.rememberFromTool(sessionID, input?.tool, toolResult.args)
       if (typeof input?.tool === "string" && NON_PROGRESS_TOOLS.has(input.tool.toLowerCase())) return
-      const toolResult = output as { output?: unknown; error?: unknown }
       // A successful tool output is real progress: it resolves any pending
       // continuation and clears the prompt-failure counter. Failed tool
       // outputs leave the failure counter and pending window untouched.
@@ -1645,7 +1659,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
     async "experimental.session.compacting"(input, output) {
       const goal = await getGoal(input.sessionID)
       if (!goal) return
-      output.context.push(compactionContext(goal))
+      output.context.push(compactionContext(goal, await sessionTodos.resolve(input.sessionID)))
     },
     async "experimental.compaction.autocontinue"(input, output) {
       const goal = await getGoal(input.sessionID)
@@ -1654,6 +1668,12 @@ const server: Plugin = async ({ client }, options?: Options) => {
     async event({ event }) {
       const sessionID = sessionIDFromEvent(event as never)
       const eventType = (event as { type?: string }).type
+      if (eventType === "todo.updated") {
+        sessionTodos.rememberFromEvent(
+          sessionID,
+          (event as { properties?: Record<string, unknown> }).properties ?? event,
+        )
+      }
       if (eventType === "session.created") {
         taskTracker.observeSessionCreated(event as { properties?: Record<string, unknown> })
       }
@@ -1743,6 +1763,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
         taskDeferredSessions.delete(sessionID)
         clearToolAttemptsForSession(toolAttempts, sessionID)
         taskTracker.observeSessionDeleted(sessionID)
+        sessionTodos.forget(sessionID)
       }
       if (sessionID && (event as { type?: string }).type === "message.updated") {
         const props = (event as { properties?: Record<string, unknown> }).properties ?? {}
@@ -1797,6 +1818,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   // See the V1 comment: pending-attempt id captured at tool-call start so a
   // delayed tool output cannot clear a newer pending attempt.
   const toolAttempts = new Map<string, string | null>()
+  const sessionTodos = new SessionTodoTracker((context as { client?: unknown }).client)
   const planAgents = restrictedAgentSet(options)
   const isPlanAgent = (agent: unknown) => typeof agent === "string" && planAgents.has(agent.trim().toLowerCase())
   const activeContinuationsV2 = new Set<string>()
@@ -1883,7 +1905,11 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       activeContinuationsV2.add(sessionID)
       claimedContinuation = true
       watchdogRescuedSessions.add(sessionID)
-      await sendContinuation(sessionID, continuationPrompt(current), current.lastPromptAgent ?? latestStep?.agent ?? null)
+      await sendContinuation(
+        sessionID,
+        continuationPrompt(current, await sessionTodos.resolve(sessionID)),
+        current.lastPromptAgent ?? latestStep?.agent ?? null,
+      )
       // Watchdog rescues are untracked retries: a delivered prompt arms the
       // pending-continuation window but never consumes an auto-turn or
       // no-progress budget (armNoProgress: false). The rescue delivers while
@@ -2071,9 +2097,10 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
         await rollbackContinuationAttempt(sessionID)
         return
       }
+      const todos = await sessionTodos.resolve(sessionID)
       await sendContinuation(
         sessionID,
-        goal.status === "active" ? continuationPrompt(goal) : limitPrompt(goal),
+        goal.status === "active" ? continuationPrompt(goal, todos) : limitPrompt(goal, todos),
         goal.lastPromptAgent ?? latestTurnAgent ?? null,
       )
       if (disposed) {
@@ -2140,6 +2167,10 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       return
     }
     switch (event.type) {
+      case "todo.updated": {
+        sessionTodos.rememberFromEvent(sessionID, data)
+        return
+      }
       case "session.created": {
         const parentID = data.parentID
         if (sessionID && typeof parentID === "string") {
@@ -2283,6 +2314,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
         taskDeferredSessions.delete(sessionID)
         clearToolAttemptsForSession(toolAttempts, sessionID)
         taskTracker.observeSessionDeleted(sessionID)
+        sessionTodos.forget(sessionID)
         latestStepBySession.delete(sessionID)
         stepTokenSums.delete(sessionID)
         for (const key of [...stepTextBuffers.keys()]) {
@@ -2483,6 +2515,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       taskTracker.noteTaskCall({ tool: input.tool, sessionID: input.sessionID, callID: input.id })
       const sessionID = typeof input.sessionID === "string" ? input.sessionID : undefined
       const callID = typeof input.id === "string" ? input.id : undefined
+      sessionTodos.rememberFromTool(sessionID, input.tool, (input as { args?: unknown }).args)
       if (sessionID && callID) {
         const goal = await getGoalInternal(sessionID)
         toolAttempts.set(toolAttemptKey(sessionID, callID), goal?.pendingAttempt?.id ?? null)
@@ -2499,6 +2532,9 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       if (attemptKey) toolAttempts.delete(attemptKey)
       if (input.status !== "completed") return
       const text = textFromToolResult(input.result)
+      sessionTodos.rememberFromTool(sessionID, input.tool, (input as { args?: unknown }).args)
+      sessionTodos.rememberFromTool(sessionID, input.tool, input.result)
+      sessionTodos.rememberFromTool(sessionID, input.tool, text)
       taskTracker.noteTaskOutput(
         { tool: input.tool, sessionID: input.sessionID, callID: input.id },
         { output: textFromToolResult(input.result) },

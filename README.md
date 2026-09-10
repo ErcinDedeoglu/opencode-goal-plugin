@@ -22,6 +22,7 @@ The OpenCode Goal Plugin adds:
 - Goal close evidence: `complete` requires verified evidence, and `unmet` requires a concrete blocker.
 - Persistent per-session goal state with history, checkpoints, budgets, and owner-only file permissions.
 - Optional automatic continuation on `session.idle` / `session.status`, with no-progress pause and budget wrap-up safeguards.
+- Uses OpenCode's built-in `todowrite` session checklist as a work breakdown under the goal. Completing todos never closes the goal.
 - Plan-mode safety: goals created from the `plan` agent stay paused, and auto-continue never escapes a Plan-mode session or switches agents on its own.
 - Compaction context so active goals are preserved when OpenCode summarizes a long session.
 
@@ -191,6 +192,8 @@ Bare `/goal` reports the current goal state. `/goal history` reports lifecycle h
 You can also ask the agent to formulate the objective and call `set_goal` itself, for example: "set your own goal to finish this refactor safely." The tool uses the agent-written objective but still only creates a goal when explicitly requested.
 
 When writing the objective, include the scope, non-goals, and verification path when they matter. The agent is reminded to audit real files, command output, tests, or PR state before closing the goal.
+
+For multi-step work, the agent should keep a short OpenCode todo list (`todowrite`) as the in-session checklist. That list is native OpenCode UI, not a nested goal. Keep todo items brief and actionable; do not paste the full objective into a todo. Checking every box does not complete the goal — `update_goal` still requires evidence or a concrete blocker. Continuation and compaction prompts include remaining todo progress when the plugin has seen `todo.updated` or a `todowrite` call.
 
 The `update_goal` tool can close a goal in two ways:
 

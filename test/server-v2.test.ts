@@ -388,6 +388,8 @@ test("V2 setup registers /goal, /pause_goal, and /resume_goal via command transf
   expect(mock.promptCalls[0]?.text).toContain("never call it again")
   expect(mock.promptCalls[0]?.text).toContain("faithful representation")
   expect(mock.promptCalls[0]?.text).toContain("do NOT compress, truncate")
+  expect(mock.promptCalls[0]?.text).toContain("todowrite")
+  expect(mock.promptCalls[0]?.text).toContain("Completing every todo does not complete the goal")
   expect(mock.promptCalls[0]?.text.match(/\$ARGUMENTS/g)).toHaveLength(1)
 
   await command?.execute({ sessionID: "ses_empty", prompt: { text: "" }, delivery: "steer" })
@@ -886,6 +888,59 @@ test("V2 global execution events only continue goals in the plugin instance loca
   expect(mock.promptCalls).toHaveLength(0)
   await mock.stream.push({ type: "session.execution.succeeded", created: 3, location, data: { sessionID: "ses_v2" } })
   expect(mock.promptCalls).toHaveLength(1)
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 continuation includes todo.updated progress without completing the goal", async () => {
+  const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0, max_auto_turns: 5 })
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "auto-continue from idle events")
+
+  await mock.stream.push({
+    type: "todo.updated",
+    created: Date.now(),
+    data: {
+      sessionID: "ses_v2",
+      todos: [
+        { content: "write tests", status: "completed" },
+        { content: "update README", status: "pending" },
+      ],
+    },
+  })
+  mock.stream.push({ type: "session.idle", created: Date.now(), data: { sessionID: "ses_v2" } })
+
+  await waitFor(() => mock.promptCalls.length === 1)
+  expect(mock.promptCalls[0]?.text).toContain("Remaining: 1/2")
+  expect(mock.promptCalls[0]?.text).toContain("update README")
+  expect(mock.promptCalls[0]?.text).toContain("Completing every todo does not complete the goal")
+  expect((await getGoal("ses_v2"))?.status).toBe("active")
+
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 todowrite execute.after is cached for continuation", async () => {
+  const mock = makeMockContext({ auto_continue: true, min_continue_interval_seconds: 0, max_auto_turns: 5 })
+  const cleanup = await setupPlugin(mock as never)
+  await createGoalViaV2Tool(mock, "cache todowrite output")
+
+  await mock.hooks["execute.after"]!({
+    tool: "todowrite",
+    sessionID: "ses_v2",
+    id: "call_todo",
+    status: "completed",
+    result: {
+      output: JSON.stringify([{ content: "extract copy", status: "in_progress" }]),
+      metadata: { todos: [{ content: "extract copy", status: "in_progress" }] },
+    },
+  })
+  mock.stream.push({ type: "session.idle", created: Date.now(), data: { sessionID: "ses_v2" } })
+
+  await waitFor(() => mock.promptCalls.length === 1)
+  expect(mock.promptCalls[0]?.text).toContain("- in_progress: extract copy")
+  expect((await getGoal("ses_v2"))?.status).toBe("active")
+
   mock.stream.end()
   await cleanup()
 })
