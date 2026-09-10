@@ -8,7 +8,68 @@ const MAX_LISTED_REMAINING = 8
 const MAX_TODO_CONTENT_CHARS = 120
 
 export const TODO_NOT_COMPLETION =
-  "Completing every todo does not complete the goal. Close the goal only with update_goal after an evidence audit."
+  "Completing every todo does not complete the goal. Close the goal only with update_goal after an evidence audit. " +
+  "Do not add todos whose job is to close, complete, or update the goal."
+
+const GOAL_TOOL_NAME = /\b(?:update_goal|create_goal|get_goal|clear_goal|set_goal|update_goal_status|update_goal_objective)\b/i
+const CLOSE_THE_GOAL = /\b(?:close|complete|finish)\s+(?:the\s+)?(?:session\s+)?goal\b/i
+const MARK_GOAL_CLOSED = /\bmark\s+(?:the\s+)?goal\s+(?:as\s+)?(?:complete|completed|done|unmet|closed)\b/i
+const AND_CLOSE_GOAL = /\band\s+close\s+(?:the\s+)?goal\b/i
+
+export function isGoalLifecycleTodo(content: string) {
+  const text = content.trim()
+  if (!text) return false
+  return GOAL_TOOL_NAME.test(text) || CLOSE_THE_GOAL.test(text) || MARK_GOAL_CLOSED.test(text) || AND_CLOSE_GOAL.test(text)
+}
+
+function normalizeSingleInProgress(todos: SessionTodo[]) {
+  let seenInProgress = false
+  return todos.map((todo) => {
+    if (todo.status !== "in_progress") return todo
+    if (seenInProgress) return { ...todo, status: "pending" }
+    seenInProgress = true
+    return todo
+  })
+}
+
+function sameTodos(left: SessionTodo[], right: SessionTodo[]) {
+  if (left.length !== right.length) return false
+  return left.every((todo, index) => {
+    const other = right[index]
+    return (
+      other != null &&
+      todo.content === other.content &&
+      todo.status === other.status &&
+      todo.priority === other.priority
+    )
+  })
+}
+
+export function sanitizeSessionTodos(todos: SessionTodo[]) {
+  return normalizeSingleInProgress(todos.filter((todo) => !isGoalLifecycleTodo(todo.content)))
+}
+
+export function applyTodowriteSanitize(tool: unknown, args: unknown): { args: unknown; changed: boolean } {
+  if (typeof tool !== "string" || tool.toLowerCase() !== "todowrite") return { args, changed: false }
+  if (isRecord(args) && Array.isArray(args.todos)) {
+    const parsed = parseSessionTodos(args.todos)
+    if (!parsed) return { args, changed: false }
+    const next = sanitizeSessionTodos(parsed)
+    if (sameTodos(next, parsed)) return { args, changed: false }
+    return { args: { ...args, todos: next }, changed: true }
+  }
+  const parsed = parseSessionTodos(args)
+  if (!parsed) return { args, changed: false }
+  const next = sanitizeSessionTodos(parsed)
+  if (sameTodos(next, parsed)) return { args, changed: false }
+  return { args: next, changed: true }
+}
+
+export function rewriteTodowriteArgs(tool: unknown, holder: { args?: unknown } | null | undefined) {
+  if (!holder) return
+  const { args, changed } = applyTodowriteSanitize(tool, holder.args)
+  if (changed) holder.args = args
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -143,7 +204,7 @@ export class SessionTodoTracker {
   }
 
   remember(sessionID: string, todos: SessionTodo[]) {
-    this.todos.set(sessionID, todos)
+    this.todos.set(sessionID, sanitizeSessionTodos(todos))
   }
 
   forget(sessionID: string) {

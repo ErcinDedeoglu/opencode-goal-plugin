@@ -540,8 +540,14 @@ export function validateObjective(objective: string, limit = DEFAULT_MAX_OBJECTI
   return boundedText(objective, limit, "goal objective")
 }
 
+const VAGUE_COMPLETION_EVIDENCE = /^(done|ok|yes|complete|completed|finished|verified|success|passed)\.?$/i
+
 export function validateEvidence(evidence: string | null | undefined, label: string, limit = DEFAULT_MAX_OBJECTIVE_CHARS) {
-  return boundedText(evidence ?? "", limit, label)
+  const trimmed = boundedText(evidence ?? "", limit, label)
+  if (label === "completion evidence" && VAGUE_COMPLETION_EVIDENCE.test(trimmed)) {
+    throw new Error("completion evidence is too vague; cite concrete artifacts, outputs, or observations")
+  }
+  return trimmed
 }
 
 function normalizeState(state: State): State {

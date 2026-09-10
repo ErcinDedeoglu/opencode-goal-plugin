@@ -1,9 +1,13 @@
 import { expect, test } from "bun:test"
 import {
   TODO_NOT_COMPLETION,
+  applyTodowriteSanitize,
   fetchSessionTodos,
   formatTodoProgress,
+  isGoalLifecycleTodo,
   parseSessionTodos,
+  rewriteTodowriteArgs,
+  sanitizeSessionTodos,
   todosFromToolPayload,
 } from "../src/session-todos"
 import { continuationPrompt, limitPrompt, systemReminder } from "../src/prompts"
@@ -131,5 +135,58 @@ test("system reminder tells the model to use todowrite without treating it as go
   const reminder = systemReminder()
   expect(reminder).toContain("todowrite")
   expect(reminder).toContain("Do not paste the full objective into a todo")
+  expect(reminder).toContain("Never add a todo whose job is to close, complete, or update the goal")
   expect(reminder).toContain("Completing every todo does not complete the goal")
+})
+
+test("goal-lifecycle todos are stripped and ordinary work items are kept", () => {
+  expect(isGoalLifecycleTodo("Report both cities and close goal")).toBe(true)
+  expect(isGoalLifecycleTodo("close the goal")).toBe(true)
+  expect(isGoalLifecycleTodo("complete the goal")).toBe(true)
+  expect(isGoalLifecycleTodo("call update_goal with evidence")).toBe(true)
+  expect(isGoalLifecycleTodo("mark the goal complete")).toBe(true)
+  expect(isGoalLifecycleTodo("Look up current weather for Dubai")).toBe(false)
+  expect(isGoalLifecycleTodo("complete the payment form")).toBe(false)
+  expect(isGoalLifecycleTodo("close the HTTP connection")).toBe(false)
+  expect(isGoalLifecycleTodo("complete unit tests for the goal plugin")).toBe(false)
+
+  const kept = sanitizeSessionTodos([
+    { content: "Look up current weather for Dubai", status: "completed" },
+    { content: "Look up current weather for Ankara", status: "completed" },
+    { content: "Report both cities and close goal", status: "completed" },
+  ])
+  expect(kept.map((todo) => todo.content)).toEqual([
+    "Look up current weather for Dubai",
+    "Look up current weather for Ankara",
+  ])
+})
+
+test("todowrite args are rewritten in place to drop lifecycle items", () => {
+  const holder = {
+    args: {
+      todos: [
+        { content: "write tests", status: "in_progress", priority: "high" },
+        { content: "close the goal", status: "pending", priority: "medium" },
+      ],
+    },
+  }
+  rewriteTodowriteArgs("todowrite", holder)
+  expect(holder.args.todos).toEqual([{ content: "write tests", status: "in_progress", priority: "high" }])
+  expect(applyTodowriteSanitize("bash", holder.args).changed).toBe(false)
+})
+
+test("todowrite keeps exactly one in_progress item", () => {
+  const holder = {
+    args: {
+      todos: [
+        { content: "write tests", status: "in_progress" },
+        { content: "update README", status: "in_progress" },
+      ],
+    },
+  }
+  rewriteTodowriteArgs("todowrite", holder)
+  expect(holder.args.todos).toEqual([
+    { content: "write tests", status: "in_progress" },
+    { content: "update README", status: "pending" },
+  ])
 })

@@ -181,7 +181,7 @@ Defaults:
 
 ## Goal Workflow
 
-Use `/goal <objective>` in a fresh OpenCode chat to create a long-running goal:
+Use `/goal <objective>` in a fresh OpenCode chat to create a long-running goal. The plugin stores that argument text as the objective; the model does not get to rephrase it:
 
 ```text
 /goal review the frontend and translate visible English UI text to Spanish
@@ -189,11 +189,11 @@ Use `/goal <objective>` in a fresh OpenCode chat to create a long-running goal:
 
 Bare `/goal` reports the current goal state. `/goal history` reports lifecycle history and recent checkpoints. `/goal edit <objective>` updates the current objective. `/goal pause` pauses the goal without clearing it, and `/goal resume` resumes it. The standalone `/pause_goal` and `/resume_goal` controls are discoverable by remote integrations that expose OpenCode's server command catalog. Their arguments and resolved attachments are removed before composing the goal-control prompt, although OpenCode V1 may evaluate its own command syntax before plugin hooks run. `/pause_goal` persists the pause before its acknowledgement turn starts, preventing a later idle event from starting another continuation. It cannot cancel a continuation that was already delivered or whose delivery was already in flight when the pause was committed. Pausing a goal that is already `budgetLimited` or `usageLimited` preserves that safety status; resuming a closed `complete` or `unmet` goal is rejected. `/goal clear` clears the goal; `/goal stop`, `/goal off`, `/goal reset`, `/goal none`, and `/goal cancel` are clear aliases. The TUI also includes a `Goal` command-palette entry for viewing, refreshing, pausing, resuming, showing history, or clearing the current goal state without creating a new goal.
 
-You can also ask the agent to formulate the objective and call `set_goal` itself, for example: "set your own goal to finish this refactor safely." The tool uses the agent-written objective but still only creates a goal when explicitly requested.
+You can also ask the agent to formulate the objective and call `set_goal` itself, for example: "set your own goal to finish this refactor safely." Chat-driven `set_goal` still uses the agent-written objective. `/goal <text>` does not: it stores the command arguments exactly.
 
 When writing the objective, include the scope, non-goals, and verification path when they matter. The agent is reminded to audit real files, command output, tests, or PR state before closing the goal.
 
-For multi-step work, the agent should keep a short OpenCode todo list (`todowrite`) as the in-session checklist. That list is native OpenCode UI, not a nested goal. Keep todo items brief and actionable; do not paste the full objective into a todo. Checking every box does not complete the goal — `update_goal` still requires evidence or a concrete blocker. Continuation and compaction prompts include remaining todo progress when the plugin has seen `todo.updated` or a `todowrite` call.
+For multi-step work, the agent should keep a short OpenCode todo list (`todowrite`) as the in-session checklist. That list is native OpenCode UI, not a nested goal. Keep todo items brief and actionable; do not paste the full objective into a todo, and do not add todos whose job is to close or complete the goal. Checking every box does not complete the goal — `update_goal` still requires evidence or a concrete blocker. The plugin strips close-goal items from `todowrite` before they are stored. Continuation and compaction prompts include remaining todo progress when the plugin has seen `todo.updated` or a `todowrite` call.
 
 The `update_goal` tool can close a goal in two ways:
 

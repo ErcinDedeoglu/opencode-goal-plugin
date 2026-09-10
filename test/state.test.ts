@@ -69,7 +69,7 @@ test("status transitions are idempotent and cannot reopen closed goals", async (
   await setGoalStatus("ses_1", "paused")
   expect((await getGoal("ses_1"))?.history).toEqual(paused?.history)
 
-  await completeGoal("ses_1", "verified")
+  await completeGoal("ses_1", "verified in tests")
   await expect(setGoalStatus("ses_1", "active")).rejects.toThrow("goal is closed")
   expect((await getGoal("ses_1"))?.status).toBe("complete")
 })
@@ -166,6 +166,8 @@ test("marks a goal unmet with a blocker and allows a new goal afterward", async 
 test("requires evidence when closing goals", async () => {
   await createGoal("ses_1", "ship the plugin", 100)
   await expect(completeGoal("ses_1", "")).rejects.toThrow("completion evidence must not be empty")
+  await createGoal("ses_vague", "ship it")
+  await expect(completeGoal("ses_vague", "verified")).rejects.toThrow("too vague")
   await expect(markGoalUnmet("ses_1", "")).rejects.toThrow("blocker must not be empty")
 })
 
@@ -177,7 +179,7 @@ test("objective and evidence limits use submitted Unicode code points per call",
   expect(() => validateObjective("   ", 3)).toThrow("must not be empty")
   expect(() => validateObjective("ab", 1)).toThrow("at most 1 characters")
   expect(() => validateEvidence("😀😀", "blocker", 1)).toThrow("blocker must be at most 1 characters")
-  expect(validateEvidence(" ok ", "completion evidence", 4)).toBe("ok")
+  expect(validateEvidence(" a1 ", "completion evidence", 4)).toBe("a1")
 
   const created = await createGoal("ses_limit", "😀", { maxObjectiveChars: 1 })
   expect(created.objective).toBe("😀")

@@ -383,14 +383,14 @@ test("V2 setup registers /goal, /pause_goal, and /resume_goal via command transf
   expect(mock.promptCalls[0]?.agents).toEqual([{ name: "build" }])
   expect(mock.promptCalls[0]?.skills).toEqual([{ id: "review" }])
   expect(mock.promptCalls[0]?.text).toContain('OpenCode goal mode command "/goal" was invoked')
-  expect(mock.promptCalls[0]?.text).toContain("ship $& and $ARGUMENTS")
-  expect(mock.promptCalls[0]?.text).toContain("call get_goal first")
-  expect(mock.promptCalls[0]?.text).toContain("never call it again")
-  expect(mock.promptCalls[0]?.text).toContain("faithful representation")
-  expect(mock.promptCalls[0]?.text).toContain("do NOT compress, truncate")
+  expect(mock.promptCalls[0]?.text).toContain("already stored this exact user-provided objective")
+  expect(mock.promptCalls[0]?.text).toContain("ship $&amp; and $ARGUMENTS")
+  expect(mock.promptCalls[0]?.text).toContain("Do not call create_goal")
   expect(mock.promptCalls[0]?.text).toContain("todowrite")
+  expect(mock.promptCalls[0]?.text).toContain("Never add a todo whose job is to close, complete, or update the goal")
   expect(mock.promptCalls[0]?.text).toContain("Completing every todo does not complete the goal")
-  expect(mock.promptCalls[0]?.text.match(/\$ARGUMENTS/g)).toHaveLength(1)
+  expect(mock.promptCalls[0]?.text).not.toContain("call create_goal once")
+  expect((await getGoal("ses_command"))?.objective).toBe("ship $& and $ARGUMENTS")
 
   await command?.execute({ sessionID: "ses_empty", prompt: { text: "" }, delivery: "steer" })
   expect(mock.promptCalls[1]).toMatchObject({ sessionID: "ses_empty", delivery: "steer" })
@@ -941,6 +941,26 @@ test("V2 todowrite execute.after is cached for continuation", async () => {
   expect(mock.promptCalls[0]?.text).toContain("- in_progress: extract copy")
   expect((await getGoal("ses_v2"))?.status).toBe("active")
 
+  mock.stream.end()
+  await cleanup()
+})
+
+test("V2 todowrite execute.before strips close-goal items from args", async () => {
+  const mock = makeMockContext({ auto_continue: false })
+  const cleanup = await setupPlugin(mock as never)
+  const input = {
+    tool: "todowrite",
+    sessionID: "ses_v2",
+    id: "call_todo",
+    args: {
+      todos: [
+        { content: "write tests", status: "in_progress", priority: "high" },
+        { content: "close the goal", status: "pending", priority: "medium" },
+      ],
+    },
+  }
+  await mock.hooks["execute.before"]!(input)
+  expect(input.args.todos.map((todo) => todo.content)).toEqual(["write tests"])
   mock.stream.end()
   await cleanup()
 })

@@ -32,8 +32,9 @@ import {
   validateEvidence,
   validateObjective,
 } from "./state"
+import { extractGoalCommandArguments, goalCommandPrefix, goalWorkPrompt, parseGoalCommandAction } from "./goal-command"
 import { compactionContext, continuationPrompt, limitPrompt, systemReminder } from "./prompts"
-import { SessionTodoTracker } from "./session-todos"
+import { rewriteTodowriteArgs, SessionTodoTracker } from "./session-todos"
 
 type Options = {
   auto_continue?: boolean
@@ -158,8 +159,9 @@ function goalCommandTemplate(commandName: string) {
       "and do NOT substitute the content with references or pointers to external files.",
     "If the user includes explicit budget instructions, pass token_budget, max_auto_turns, or max_duration_seconds to " +
       "create_goal rather than leaving those words in the objective.",
-    "After the goal exists, use OpenCode's todowrite tool for a short session checklist of remaining steps.",
+    "After the goal exists, use OpenCode's todowrite tool for a short session checklist of remaining work steps.",
     "Keep todo content brief; do not paste the full objective into a todo.",
+    "Never add a todo whose job is to close, complete, or update the goal.",
     "Completing every todo does not complete the goal; close it only with update_goal after an evidence audit.",
   ].join(" ")
 
@@ -976,6 +978,24 @@ function taskDeferralGoalContinuable(goal: GoalSnapshot | null | undefined) {
   return goal.status === "active"
 }
 
+async function materializeGoalFromCommandArgs(
+  sessionID: string,
+  rawArgs: string,
+  agent: string | undefined,
+  commandName: string,
+  services: GoalServices,
+) {
+  const action = parseGoalCommandAction(rawArgs)
+  if (action.type !== "create") return undefined
+  const payload = JSON.parse(await createGoalFromTool({ objective: action.objective }, { sessionID, agent }, services)) as {
+    goal: GoalSnapshot
+    goal_reused?: boolean
+    goal_conflict?: boolean
+  }
+  const kind = payload.goal_conflict ? "conflict" : payload.goal_reused ? "reused" : "created"
+  return goalWorkPrompt(commandName, payload.goal, kind)
+}
+
 function existingGoalResult(goal: GoalSnapshot, requestedObjective: string, planningOnly: boolean) {
   const reused = goal.objective === requestedObjective
   return JSON.stringify(
@@ -1583,13 +1603,35 @@ const server: Plugin = async ({ client }, options?: Options) => {
       taskTracker.noteTaskCall(input as { tool?: unknown; sessionID?: unknown; callID?: unknown })
       const sessionID = typeof input?.sessionID === "string" ? input.sessionID : undefined
       const callID = typeof input?.callID === "string" ? input.callID : undefined
-      sessionTodos.rememberFromTool(sessionID, input?.tool, (output as { args?: unknown } | undefined)?.args)
+      const argsHolder = output as { args?: unknown } | undefined
+      rewriteTodowriteArgs(input?.tool, argsHolder)
+      sessionTodos.rememberFromTool(sessionID, input?.tool, argsHolder?.args)
       if (sessionID && callID) {
         const goal = await getGoalInternal(sessionID)
         toolAttempts.set(toolAttemptKey(sessionID, callID), goal?.pendingAttempt?.id ?? null)
       }
     },
     async "command.execute.before"(input, output) {
+      if (input.command === commandName) {
+        const textPart = output.parts.find((part) => part.type === "text" && typeof part.text === "string")
+        const raw = typeof textPart?.text === "string" ? extractGoalCommandArguments(textPart.text) : undefined
+        if (raw == null || !textPart) return
+        try {
+          const next = await materializeGoalFromCommandArgs(
+            input.sessionID,
+            raw,
+            typeof (input as { agent?: unknown }).agent === "string" ? (input as { agent: string }).agent : undefined,
+            commandName,
+            goalServices,
+          )
+          if (!next) return
+          textPart.text = next
+          output.parts.splice(0, output.parts.length, textPart)
+        } catch {
+          // Leave the fallback /goal template so the model can report the failure.
+        }
+        return
+      }
       if (input.command !== "pause_goal" && input.command !== "resume_goal") return
       const template = goalStatusCommandTemplate(input.command)
       if (!sanitizeGoalStatusCommandParts(output, template)) return
@@ -2457,6 +2499,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
                 clearTurnWatchdog(input.sessionID)
               }
               let forwardedPrompt: Partial<typeof input.prompt> = {}
+              let text = command.template.replaceAll("$ARGUMENTS", () => input.prompt.text.trim())
               if (command.action === "goal") {
                 const stripMention = <T extends { mention?: unknown }>({ mention: _mention, ...attachment }: T) => attachment
                 const { files, agents, skills, ...promptFields } = input.prompt
@@ -2466,11 +2509,23 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
                   ...(agents ? { agents: agents.map(stripMention) } : {}),
                   ...(skills ? { skills: skills.map(stripMention) } : {}),
                 }
+                try {
+                  const next = await materializeGoalFromCommandArgs(
+                    input.sessionID,
+                    input.prompt.text,
+                    typeof agents?.[0]?.name === "string" ? agents[0].name : undefined,
+                    command.name,
+                    goalServices,
+                  )
+                  if (next) text = next
+                } catch {
+                  // Keep the fallback /goal template so the model can report the failure.
+                }
               }
               await context.session.prompt({
                 ...forwardedPrompt,
                 sessionID: input.sessionID,
-                text: command.template.replaceAll("$ARGUMENTS", () => input.prompt.text.trim()),
+                text,
                 delivery: input.delivery,
               })
             },
@@ -2483,6 +2538,23 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     // their lifecycle action again at the shared prompt-admission boundary.
     registrations.push(
       await context.session.hook("prompt", async (input) => {
+        if (input.prompt.text.startsWith(goalCommandPrefix(commandName))) {
+          const raw = extractGoalCommandArguments(input.prompt.text)
+          if (raw == null) return
+          try {
+            const next = await materializeGoalFromCommandArgs(
+              input.sessionID,
+              raw,
+              input.prompt.agents?.[0]?.name,
+              commandName,
+              goalServices,
+            )
+            if (next) input.prompt.text = next
+          } catch {
+            // Keep the fallback /goal template so the model can report the failure.
+          }
+          return
+        }
         const pauseTemplate = goalStatusCommandTemplate("pause_goal")
         const resumeTemplate = goalStatusCommandTemplate("resume_goal")
         const template = input.prompt.text.startsWith(pauseTemplate)
@@ -2515,7 +2587,9 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       taskTracker.noteTaskCall({ tool: input.tool, sessionID: input.sessionID, callID: input.id })
       const sessionID = typeof input.sessionID === "string" ? input.sessionID : undefined
       const callID = typeof input.id === "string" ? input.id : undefined
-      sessionTodos.rememberFromTool(sessionID, input.tool, (input as { args?: unknown }).args)
+      const argsHolder = input as { args?: unknown }
+      rewriteTodowriteArgs(input.tool, argsHolder)
+      sessionTodos.rememberFromTool(sessionID, input.tool, argsHolder.args)
       if (sessionID && callID) {
         const goal = await getGoalInternal(sessionID)
         toolAttempts.set(toolAttemptKey(sessionID, callID), goal?.pendingAttempt?.id ?? null)
