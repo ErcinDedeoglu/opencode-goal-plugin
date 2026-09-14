@@ -60,3 +60,25 @@ jobs:
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile
       - run: bun run build
+
+  v2-smoke:
+    name: V2 Lifecycle Smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun run build
+      - name: Install OpenCode V2
+        run: npm install -g @opencode/cli@beta
+      - run: bun run smoke:v2
+        env:
+          OPENCODE_SMOKE_TIMEOUT_MS: "120000"
+          OPENCODE_SMOKE_ARTIFACTS_DIR: ${{ runner.temp }}/smoke-artifacts
+      - name: Upload smoke artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v2-smoke-artifacts
+          path: ${{ runner.temp }}/smoke-artifacts
+          if-no-files-found: ignore

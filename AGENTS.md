@@ -6,7 +6,7 @@ This package is an OpenCode plugin with separate server and TUI entrypoints:
 
 - `src/server.ts` is the server plugin. It registers the `/goal` command, goal tools, chat/session hooks, usage accounting, compaction context, and idle auto-continuation.
 - `src/state.ts` owns goal persistence and lifecycle state. It stores JSON at `OPENCODE_GOAL_STATE_PATH` when set, otherwise under the user's OpenCode data location.
-- `src/tui.tsx` is the Solid/OpenTUI sidebar and command-palette UI. It is exported as source, so avoid adding heavy runtime dependencies here unless there is a strong reason.
+- `src/tui.ts` is the Solid/OpenTUI sidebar and command-palette UI. It is exported as source, so avoid adding heavy runtime dependencies here unless there is a strong reason. OpenTUI/solid are peer dependencies resolved from the host at runtime.
 - `src/prompts.ts` contains the goal-mode continuation/system/compaction prompts.
 - `test/` covers state, server hooks/tools, and TUI behavior with Bun tests.
 
