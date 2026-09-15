@@ -448,6 +448,29 @@ test("V2 setup registers /goal, /pause_goal, and /resume_goal via command transf
   await cleanup()
 })
 
+test("V2 /goal with a different objective supersedes a stale non-closed goal", async () => {
+  const mock = makeMockContext({ auto_continue: false })
+  const cleanup = await setupPlugin(mock as never)
+  await createGoal("ses_supersede", "old interrupted objective")
+  const command = mock.commands.find((candidate) => candidate.name === "goal")!
+  await command.execute({
+    sessionID: "ses_supersede",
+    prompt: { text: "new objective from goal file" },
+    delivery: "queue",
+  })
+  expect(mock.promptCalls).toHaveLength(1)
+  expect(mock.promptCalls[0]?.text).toContain("already stored this exact user-provided objective")
+  expect(mock.promptCalls[0]?.text).toContain("new objective from goal file")
+  expect(mock.promptCalls[0]?.text).not.toContain("old interrupted objective")
+  expect(mock.promptCalls[0]?.text).not.toContain("A different non-closed goal already exists")
+  const goal = await getGoal("ses_supersede")
+  expect(goal?.objective).toBe("new objective from goal file")
+  expect(goal?.status).toBe("active")
+
+  mock.stream.end()
+  await cleanup()
+})
+
 test("V2 setup preserves existing commands and configured command-name collisions", async () => {
   const mock = makeMockContext({ auto_continue: false, command_name: "pause_goal" }, ["resume_goal"])
   const cleanup = await setupPlugin(mock as never)

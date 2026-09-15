@@ -1018,6 +1018,18 @@ async function materializeGoalFromCommandArgs(
 ) {
   const action = parseGoalCommandAction(rawArgs)
   if (action.type !== "create") return undefined
+  const objective = validateObjective(action.objective, services.maxObjectiveChars)
+  const existing = await getGoal(sessionID)
+  if (existing && !isClosedGoal(existing) && existing.objective !== objective) {
+    // The /goal command is an explicit user request, so a different non-closed goal
+    // (for example one left active by an interruption) is superseded instead of
+    // blocking the command. The create_goal tool keeps its own conflict guard.
+    await markGoalUnmet(
+      sessionID,
+      `Superseded by a new goal from the /${commandName} command.`,
+      services.maxObjectiveChars,
+    )
+  }
   const payload = JSON.parse(await createGoalFromTool({ objective: action.objective }, { sessionID, agent }, services)) as {
     goal: GoalSnapshot
     goal_reused?: boolean

@@ -6,6 +6,7 @@ import { z } from "zod"
 import plugin from "../src/server"
 import {
   accountUsage,
+  createGoal,
   getGoal,
   getGoalInternal,
   recordContinuationResult,
@@ -397,6 +398,38 @@ test("/goal stores the exact command arguments as the objective", async () => {
   expect(output.parts[0]?.text).toContain("how is weather in dubai and ankara")
   expect(output.parts[0]?.text).not.toContain("call create_goal once")
   expect((await getGoal("ses_raw"))?.objective).toBe("how is weather in dubai and ankara")
+})
+
+test("/goal with a different objective supersedes a stale non-closed goal", async () => {
+  const hooks = await setupServer(
+    {
+      client: {
+        session: {
+          promptAsync: async () => {},
+        },
+      },
+    } as never,
+    { auto_continue: false },
+  )
+  await createGoal("ses_stale", "old interrupted objective")
+  const output = {
+    parts: [
+      {
+        type: "text",
+        text:
+          `OpenCode goal mode command "/goal" was invoked.\n\nArguments:\n<goal_command_arguments>\n` +
+          `new objective from goal file\n</goal_command_arguments>\n`,
+      },
+    ],
+  }
+  await hooks["command.execute.before"]!({ command: "goal", sessionID: "ses_stale" } as never, output as never)
+  expect(output.parts[0]?.text).toContain("already stored this exact user-provided objective")
+  expect(output.parts[0]?.text).toContain("new objective from goal file")
+  expect(output.parts[0]?.text).not.toContain("old interrupted objective")
+  expect(output.parts[0]?.text).not.toContain("A different non-closed goal already exists")
+  const goal = await getGoal("ses_stale")
+  expect(goal?.objective).toBe("new objective from goal file")
+  expect(goal?.status).toBe("active")
 })
 
 test("system transform is byte-stable across the complete goal lifecycle", async () => {

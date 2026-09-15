@@ -2376,6 +2376,11 @@ async function materializeGoalFromCommandArgs(sessionID, rawArgs, agent, command
   const action = parseGoalCommandAction(rawArgs);
   if (action.type !== "create")
     return;
+  const objective = validateObjective(action.objective, services.maxObjectiveChars);
+  const existing = await getGoal(sessionID);
+  if (existing && !isClosedGoal(existing) && existing.objective !== objective) {
+    await markGoalUnmet(sessionID, `Superseded by a new goal from the /${commandName} command.`, services.maxObjectiveChars);
+  }
   const payload = JSON.parse(await createGoalFromTool({ objective: action.objective }, { sessionID, agent }, services));
   const kind = payload.goal_conflict ? "conflict" : payload.goal_reused ? "reused" : "created";
   return goalWorkPrompt(commandName, payload.goal, kind);
