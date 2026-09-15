@@ -1,7 +1,8 @@
 import type { Config, Plugin } from "@opencode-ai/plugin"
-import type * as PluginV2 from "@opencode-ai/plugin-v2"
-import type { Info as ToolV2Info } from "@opencode-ai/plugin-v2/promise/tool"
-import type { Tool as ToolSchema } from "@opencode-ai/schema/tool"
+import type * as PluginV2 from "@opencode/plugin"
+import type { Info as ToolV2Info } from "@opencode/plugin/promise/tool"
+import type { Tool as ToolSchema } from "@opencode/schema/tool"
+import type { SessionMessageInfo } from "@opencode/client"
 import { z } from "zod"
 import type { GoalSnapshot, InternalGoalSnapshot, PendingAttempt } from "./state"
 import {
@@ -33,7 +34,7 @@ import {
   validateObjective,
 } from "./state"
 import { extractGoalCommandArguments, goalCommandPrefix, goalWorkPrompt, parseGoalCommandAction } from "./goal-command"
-import { compactionContext, continuationPrompt, limitPrompt, systemReminder } from "./prompts"
+import { COMPACTION_CONTEXT_PREFIX, compactionContext, continuationPrompt, limitPrompt, systemReminder } from "./prompts"
 import { rewriteTodowriteArgs, SessionTodoTracker } from "./session-todos"
 
 type Options = {
@@ -676,6 +677,36 @@ class TaskTracker {
     if (marker) this.observeAssistant(sessionID, marker)
   }
 
+  // Restart recovery on V2: the plugin context exposes no live child-session
+  // query, so rebuild deferral state from each goal session's persisted
+  // transcript. Only finalized tool entries carry trustworthy status text.
+  // The replay includes assistant markers so a terminal child is reconciled
+  // by any later orchestrator turn in the transcript, mirroring live V2
+  // semantics where a task that goes terminal mid-turn is stamped with its
+  // own message's marker. Terminal timestamps are historical when the message
+  // carries time.completed; running children keep a restart-time runningSince
+  // (conservative - prevents an old-but-alive child from expiring the block
+  // ceiling immediately after restart).
+  recoverFromTranscript(parentSessionID: string, messages: readonly SessionMessageInfo[]) {
+    for (const message of messages) {
+      if (message.type !== "assistant") continue
+      if (typeof message.id === "string") {
+        this.observeAssistantMessage(parentSessionID, {
+          info: { id: message.id, role: "assistant", time: message.time },
+        })
+      }
+      const terminalAt = messageCompletedAt({ time: message.time }) ?? undefined
+      for (const entry of message.content) {
+        if (entry.type !== "tool" || !["task", "subagent"].includes(entry.name.toLowerCase())) continue
+        if (entry.state.status === "streaming" || entry.state.status === "running") continue
+        const status = parseTaskStatus(toolTextFromV2Content(entry.state.content ?? []))
+        if (!status) continue
+        if (status.state === "running") this.markRunning(parentSessionID, status.taskID)
+        else this.markTerminal(status.taskID, status.state, parentSessionID, { resetReconciled: true, terminalAt })
+      }
+    }
+  }
+
   hasBlockingTasks(parentSessionID: string, maxBlockMs: number | null = null) {
     this.pruneExpiredSnapshotIdleHolds()
     const now = Date.now()
@@ -753,7 +784,7 @@ class TaskTracker {
     taskID: string,
     state: TaskState,
     parentSessionID?: string,
-    options: { resetReconciled?: boolean } = {},
+    options: { resetReconciled?: boolean; terminalAt?: number } = {},
   ) {
     if (!TASK_TERMINAL_STATES.has(state)) return
     const existing = this.tasks.get(taskID)
@@ -787,7 +818,7 @@ class TaskTracker {
       state,
       terminalUnreconciled: true,
       runningSince: null,
-      terminalAt: continuesExistingTerminal ? existing.terminalAt ?? Date.now() : Date.now(),
+      terminalAt: options.terminalAt ?? (continuesExistingTerminal ? existing.terminalAt ?? Date.now() : Date.now()),
       lastAssistantMessageIDAtTerminal: continuesExistingTerminal
         ? existing.lastAssistantMessageIDAtTerminal
         : this.latestAssistantBySession.get(resolvedParentSessionID)?.id ?? null,
@@ -1093,6 +1124,11 @@ type V2StepRecord = {
   completedAt: number | null
 }
 
+type V2CompactionHookEvent = {
+  readonly sessionID: string
+  system: Array<{ type: string; text: string }>
+}
+
 function textFromToolResult(result: { output?: unknown; content?: unknown }): string | undefined {
   if (typeof result.output === "string") return result.output
   if (typeof result.content === "string") return result.content
@@ -1101,6 +1137,14 @@ function textFromToolResult(result: { output?: unknown; content?: unknown }): st
     return text || undefined
   }
   return undefined
+}
+
+function toolTextFromV2Content(content: readonly unknown[]) {
+  return content
+    .map((entry) => (isRecord(entry) && entry.type === "text" && typeof entry.text === "string" ? entry.text : ""))
+    .filter(Boolean)
+    .join("\n")
+    .trim()
 }
 
 // Tool calls are correlated to the pending attempt that was active when they
@@ -1334,11 +1378,13 @@ const server: Plugin = async ({ client }, options?: Options) => {
         // Always re-arm. A task block is the only deferral that records nothing on the
         // goal, so without a scheduled retry a child that never reports a terminal state
         // silently ends auto-continuation: nothing refreshes live children again and the
-        // goal keeps reading active with no stop reason.
+        // goal keeps reading active with no stop reason. When a fresh child snapshot adds
+        // a shorter idle-grace deadline, replace the older fallback timer so the stale
+        // running record is revisited promptly even if a poll was already queued.
         scheduleSettledContinuation(
           sessionID,
           taskStatus.retryAt != null ? taskStatus.retryAt - Date.now() : TASK_BLOCK_RETRY_MS,
-          scheduled != null,
+          scheduled != null || taskStatus.retryAt != null,
         )
         return
       }
@@ -1613,20 +1659,23 @@ const server: Plugin = async ({ client }, options?: Options) => {
     },
     async "command.execute.before"(input, output) {
       if (input.command === commandName) {
-        const textPart = output.parts.find((part) => part.type === "text" && typeof part.text === "string")
+        const parts = output.parts as Array<{ type: string; text?: string }>
+        const textPart = parts.find((part) => part.type === "text" && typeof part.text === "string")
         const raw = typeof textPart?.text === "string" ? extractGoalCommandArguments(textPart.text) : undefined
         if (raw == null || !textPart) return
         try {
           const next = await materializeGoalFromCommandArgs(
             input.sessionID,
             raw,
-            typeof (input as { agent?: unknown }).agent === "string" ? (input as { agent: string }).agent : undefined,
+            typeof (input as unknown as { agent?: unknown }).agent === "string"
+              ? (input as unknown as { agent: string }).agent
+              : undefined,
             commandName,
             goalServices,
           )
           if (!next) return
           textPart.text = next
-          output.parts.splice(0, output.parts.length, textPart)
+          parts.splice(0, parts.length, textPart)
         } catch {
           // Leave the fallback /goal template so the model can report the failure.
         }
@@ -1891,6 +1940,8 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
   }
 
   async function sendContinuation(sessionID: string, prompt: string, agent?: string | null) {
+    // Delivering a prompt for a session proves this instance owns it.
+    markSessionOwnership(sessionID, true)
     await context.session.prompt({
       sessionID,
       text: prompt,
@@ -1929,6 +1980,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     let claimedContinuation = false
     try {
       if (disposed) return
+      await taskRecoveryComplete
       if (turnWatchdogs.get(sessionID) !== watchdog || !busySessions.has(sessionID) || watchdogRescuedSessions.has(sessionID))
         return
       const goal = await getGoal(sessionID)
@@ -2018,6 +2070,11 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     if (stoppedExecutions.has(sessionID)) return
     if (busySessions.has(sessionID)) return
     if (activeContinuationsV2.has(sessionID)) return
+    // Transcript recovery must settle before any continuation decision;
+    // otherwise the first lifecycle event after a restart defers to a task
+    // state that has not been rebuilt yet.
+    await taskRecoveryComplete
+    if (disposed || stoppedExecutions.has(sessionID) || busySessions.has(sessionID)) return
     activeContinuationsV2.add(sessionID)
     let attemptReservedAt = Date.now()
     try {
@@ -2184,16 +2241,92 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     }
   }
 
+  // Session events from event.subscribe() are delivered server-wide to every
+  // loaded location's plugin instance, and the session events themselves carry
+  // no envelope `location` (routing metadata stays inside the host bus). The
+  // shared goal state file must therefore only ever be mutated by the instance
+  // that hosts the session's location; sibling instances have separate
+  // in-process mutation queues, and interleaved read-modify-write across them
+  // loses updates (undercounted autoTurns, dropped reservations). Ownership is
+  // resolved from the session's own location, never inferred from the event
+  // envelope alone, and both positive and negative answers are cached per
+  // session so foreign instances stay read-only.
+  const sessionOwnership = new Map<string, boolean>()
+  const ownershipInFlight = new Map<string, Promise<boolean>>()
+
+  function locationRefMatches(
+    observed: { directory?: unknown; workspaceID?: unknown } | null | undefined,
+    own: { directory?: unknown; workspaceID?: unknown } | null | undefined,
+  ): boolean {
+    if (!observed || !own) return false
+    if (typeof observed.directory !== "string" || observed.directory !== own.directory) return false
+    const observedWorkspace = typeof observed.workspaceID === "string" ? observed.workspaceID : null
+    const ownWorkspace = typeof own.workspaceID === "string" ? own.workspaceID : null
+    return observedWorkspace === ownWorkspace
+  }
+
+  function markSessionOwnership(sessionID: string, owned: boolean) {
+    sessionOwnership.set(sessionID, owned)
+  }
+
+  async function ownsSession(sessionID: string): Promise<boolean> {
+    if (!context.location) return true
+    const cached = sessionOwnership.get(sessionID)
+    if (cached !== undefined) return cached
+    const inFlight = ownershipInFlight.get(sessionID)
+    if (inFlight) return inFlight
+    const resolution = (async () => {
+      try {
+        const response = await context.session.get({ sessionID })
+        const record = response as { data?: unknown } | undefined
+        const info = record && typeof record === "object" && "data" in record
+          ? record.data
+          : response
+        const location = (info as { location?: unknown } | null | undefined)?.location
+        const owned = locationRefMatches(
+          location as { directory?: unknown; workspaceID?: unknown } | null | undefined,
+          context.location,
+        )
+        sessionOwnership.set(sessionID, owned)
+        return owned
+      } catch {
+        // An unresolvable session is never mutated on a guess: treat it as
+        // foreign for this event without caching, so a transient lookup
+        // failure in the owning instance recovers on the next event.
+        return false
+      } finally {
+        ownershipInFlight.delete(sessionID)
+      }
+    })()
+    ownershipInFlight.set(sessionID, resolution)
+    return resolution
+  }
+
   async function handleV2Event(event: V2EventLike) {
     const data = event.data
     const sessionID = typeof data.sessionID === "string" ? data.sessionID : undefined
     // subscribe() is server-wide. Every loaded location has a plugin instance;
     // only the owner may account usage or send a goal prompt for this event.
     // Still observe foreign child lifecycles for cross-location Task deferral.
-    if (
-      context.location && event.location &&
-      (event.location.directory !== context.location.directory || event.location.workspaceID !== context.location.workspaceID)
-    ) {
+    // Ownership resolution: an explicit event envelope is authoritative when
+    // present; session.created carries the session's location in its data;
+    // every other session event (no envelope on the wire) is resolved against
+    // the session's actual location and cached. Without this, sibling
+    // locations' instances process the same events as owners and their
+    // independent mutation queues lose updates on the shared goal state.
+    let foreign = false
+    if (context.location && sessionID) {
+      if (event.location) {
+        foreign = !locationRefMatches(event.location, context.location)
+        markSessionOwnership(sessionID, !foreign)
+      } else if (event.type === "session.created" && isRecord(data.location)) {
+        foreign = !locationRefMatches(data.location as { directory?: unknown; workspaceID?: unknown }, context.location)
+        markSessionOwnership(sessionID, !foreign)
+      } else {
+        foreign = !(await ownsSession(sessionID))
+      }
+    }
+    if (foreign) {
       if (event.type === "session.created" && sessionID && typeof data.parentID === "string") {
         taskTracker.observeSessionCreated({ properties: { info: { id: sessionID, parentID: data.parentID } } })
       } else if (sessionID) {
@@ -2204,7 +2337,15 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
         if (event.type === "session.status" && isRecord(data.status) && typeof data.status.type === "string") {
           taskTracker.observeSessionStatus(sessionID, data.status.type)
         }
-        if (event.type === "session.deleted") taskTracker.observeSessionDeleted(sessionID)
+        if (event.type === "session.deleted") {
+          // Deleted sessions must free their cached ownership in every
+          // instance, not just the owner: a long-lived shared server would
+          // otherwise retain one negative entry per deleted session per
+          // sibling location forever, and a re-created session in another
+          // location could never be re-resolved.
+          taskTracker.observeSessionDeleted(sessionID)
+          sessionOwnership.delete(sessionID)
+        }
       }
       return
     }
@@ -2288,28 +2429,21 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
         taskTracker.observeSessionStatus(sessionID, "idle")
         return
       }
-      case "session.execution.failed":
-      case "session.error": {
+      case "session.execution.failed": {
         if (!sessionID) return
         // execution.failed is emitted only after the host's retry episode has
-        // ended. Unlike a legacy session.error inside a retry, it can recover.
-        if (event.type === "session.execution.failed") nativeRetrySessions.delete(sessionID)
-        const inNativeRetry = nativeRetrySessions.has(sessionID)
+        // ended, so the failure can still recover.
+        nativeRetrySessions.delete(sessionID)
         busySessions.delete(sessionID)
         clearTurnWatchdog(sessionID)
-        // Same policy as V1: a native provider retry episode is already
-        // recovering, so a transport error inside it must not schedule plugin
-        // recovery, and the marker stays until busy/idle ends the episode.
-        if (inNativeRetry) return
-        nativeRetrySessions.delete(sessionID)
         watchdogRescuedSessions.delete(sessionID)
         const errorMessage = transportErrorMessageFromEvent(data)
-        if (event.type === "session.execution.failed" && !isTransportError(errorMessage)) {
+        if (!isTransportError(errorMessage)) {
           stoppedExecutions.add(sessionID)
           cancelScheduledContinuation(sessionID)
           taskDeferredSessions.delete(sessionID)
         }
-        if (event.type === "session.execution.failed") taskTracker.observeSessionStatus(sessionID, "idle")
+        taskTracker.observeSessionStatus(sessionID, "idle")
         if (errorMessage && isTransportError(errorMessage)) {
           const goal = await getGoalInternal(sessionID)
           if (goal?.status === "active") {
@@ -2345,6 +2479,7 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       case "session.deleted": {
         if (!sessionID) return
         stoppedExecutions.delete(sessionID)
+        sessionOwnership.delete(sessionID)
         busySessions.delete(sessionID)
         clearTurnWatchdog(sessionID)
         watchdogRescuedSessions.delete(sessionID)
@@ -2492,6 +2627,8 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
             name: command.name,
             description: command.description,
             execute: async (input) => {
+              // Command execution is routed to the session's owning location.
+              markSessionOwnership(input.sessionID, true)
               if (command.action === "pause") {
                 const goal = await getGoal(input.sessionID)
                 if (goal?.status === "active") await setGoalStatus(input.sessionID, "paused")
@@ -2538,6 +2675,8 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     // their lifecycle action again at the shared prompt-admission boundary.
     registrations.push(
       await context.session.hook("prompt", async (input) => {
+        // Prompt hooks only fire in the session's owning location.
+        if (typeof input.sessionID === "string") markSessionOwnership(input.sessionID, true)
         if (input.prompt.text.startsWith(goalCommandPrefix(commandName))) {
           const raw = extractGoalCommandArguments(input.prompt.text)
           if (raw == null) return
@@ -2586,6 +2725,8 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
     await context.tool.hook("execute.before", async (input) => {
       taskTracker.noteTaskCall({ tool: input.tool, sessionID: input.sessionID, callID: input.id })
       const sessionID = typeof input.sessionID === "string" ? input.sessionID : undefined
+      // Tool execution only happens in the session's owning location.
+      if (sessionID) markSessionOwnership(sessionID, true)
       const callID = typeof input.id === "string" ? input.id : undefined
       const argsHolder = input as { args?: unknown }
       rewriteTodowriteArgs(input.tool, argsHolder)
@@ -2641,6 +2782,54 @@ async function setupV2(context: PluginV2.Plugin.Context): Promise<PluginV2.Plugi
       sessionContext.system.push({ type: "text", text: reminder })
     }),
   )
+
+  // V2 equivalent of the V1 experimental.session.compacting hook: keep the
+  // active goal visible to the summarizer so compaction cannot drop it. The
+  // compaction hook ships in V2 builds newer than beta-19425 (the newest
+  // published beta this package targets), so register it defensively: hosts
+  // that predate the hook reject or ignore the registration, while newer
+  // hosts preserve the active goal across compaction.
+  try {
+    const hookCompaction = context.session.hook as unknown as (
+      name: "compaction",
+      callback: (event: V2CompactionHookEvent) => Promise<void>,
+    ) => Promise<{ dispose(): Promise<void> }>
+    registrations.push(
+      await hookCompaction("compaction", async (event) => {
+        const goal = await getGoal(event.sessionID)
+        if (!goal) return
+        if (event.system.some((part) => part.type === "text" && part.text.startsWith(COMPACTION_CONTEXT_PREFIX))) return
+        event.system.push({ type: "text", text: compactionContext(goal) })
+      }),
+    )
+  } catch {
+    // Host predates the session compaction hook.
+  }
+
+  // Rebuild task-deferral state for goals that survived a plugin restart. The
+  // plugin context exposes no live child-session query, so this replays each
+  // non-closed goal session's persisted transcript through the tracker. Best
+  // effort: unfetchable transcripts fall back to live-event observation only.
+  // Continuation decisions await this recovery, so a settled lifecycle event
+  // cannot slip past a pending transcript load.
+  async function recoverTrackedTasks() {
+    for (const item of (await getAllGoals()).goals) {
+      if (disposed) return
+      if (item.status === "complete" || item.status === "unmet") continue
+      try {
+        const transcript = await context.session.context({ sessionID: item.sessionID })
+        if (disposed) return
+        taskTracker.recoverFromTranscript(item.sessionID, transcript)
+      } catch (error) {
+        v2ErrorLog("Task recovery from transcript failed", error)
+      }
+    }
+  }
+  // The catch guarantees this promise never rejects: the per-item try/catch
+  // inside recoverTrackedTasks does not cover a getAllGoals() rejection.
+  const taskRecoveryComplete = recoverTrackedTasks().catch((error) => {
+    v2ErrorLog("Task recovery from transcript failed", error)
+  })
 
   const abortController = new AbortController()
   let eventIterator: AsyncIterator<unknown> | undefined

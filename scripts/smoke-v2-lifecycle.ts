@@ -1,7 +1,7 @@
 // Runs the installed OpenCode V2 binary against a deterministic local model.
 // No real provider credentials, shared service, or user goal state are used.
 import assert from "node:assert/strict"
-import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises"
+import { cp, mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 import { pathToFileURL } from "node:url"
@@ -106,16 +106,21 @@ const consume = async (stream: ReadableStream<Uint8Array>) => {
 }
 const readers = Promise.all([consume(child.stdout), consume(child.stderr)])
 const deadline = Date.now() + Number(process.env.OPENCODE_SMOKE_TIMEOUT_MS ?? 30000)
-const waitFor = async (check: () => boolean | Promise<boolean>) => {
+let lastStage: string | undefined
+const waitFor = async (stage: string, check: () => boolean | Promise<boolean>, diagnose?: () => string) => {
+  lastStage = stage
   while (Date.now() < deadline) {
     if (await check()) return
     if (child.exitCode != null) throw new Error(`Private V2 exited: ${output.slice(-4000)}`)
     await Bun.sleep(50)
   }
-  throw new Error(`Smoke timeout; modelCalls=${modelCalls}, continuationCalls=${continuationCalls}; logs=${root}/server.log`)
+  const details = diagnose?.()
+  const observed = `modelCalls=${modelCalls}, continuationCalls=${continuationCalls}${details ? `; ${details}` : ""}`
+  throw new Error(`Smoke timeout at stage "${stage}"; ${observed}; logs=${root}/server.log`)
 }
+let passed = false
 try {
-  await waitFor(() => /http:\/\/127\.0\.0\.1:\d+/.test(output))
+  await waitFor("server-ready", () => /http:\/\/127\.0\.0\.1:\d+/.test(output))
   const base = output.match(/http:\/\/127\.0\.0\.1:\d+/)![0]
   const api = async (path: string, data?: unknown) => {
     const response = await fetch(`${base}${path}`, {
@@ -145,17 +150,35 @@ try {
     command: "goal", text: "Create a goal for the fixture milestone. Keep it active until the automatic continuation arrives.",
   })
   let state: { goals: Record<string, { status: string; autoTurns: number }> } | undefined
-  await waitFor(async () => {
+  // Last-observed values for each final condition, so a timeout can report
+  // which one was stuck instead of failing opaquely.
+  let lastOutcome: string | undefined
+  let lastGoalStatus: string | undefined
+  let lastAutoTurns: number | undefined
+  let lastActiveSessionActive: boolean | undefined
+  await waitFor("goal-complete", async () => {
     const current = await api(`/api/session/${sessionID}`) as { data: { outcome?: string } }
+    lastOutcome = current.data.outcome
     if (current.data.outcome === "failed") {
       const exported = await api(`/api/session/${sessionID}/export`)
       await writeFile(join(root, "failed-session.json"), JSON.stringify(exported))
       throw new Error(`Fixture session failed; inspect ${root}/failed-session.json`)
     }
     try { state = JSON.parse(await readFile(env.OPENCODE_GOAL_STATE_PATH, "utf8")) } catch { return false }
+    lastGoalStatus = state?.goals[sessionID]?.status
+    lastAutoTurns = state?.goals[sessionID]?.autoTurns
     if (state?.goals[sessionID]?.status !== "complete") return false
     const active = await api("/api/session/active") as { data: Record<string, unknown> }
-    return !(sessionID in active.data)
+    lastActiveSessionActive = sessionID in active.data
+    return !lastActiveSessionActive
+  }, () => {
+    const parts = [
+      `goal status=${lastGoalStatus ?? "none"}`,
+      `autoTurns=${lastAutoTurns ?? "none"}`,
+      `outcome=${lastOutcome ?? "unknown"}`,
+      `stillActive=${lastActiveSessionActive ?? "unknown"}`,
+    ]
+    return parts.join(", ")
   })
   assert.equal(state!.goals[sessionID]!.autoTurns, 2)
   assert(continuationCalls > 0)
@@ -172,15 +195,50 @@ try {
     agents: [],
     skills: [],
   })
-  await waitFor(async () => {
+  await waitFor("arrays-goal-registered", async () => {
     try { state = JSON.parse(await readFile(env.OPENCODE_GOAL_STATE_PATH, "utf8")) } catch { return false }
     return state?.goals[arraysSession.data.id] != null
   })
-  console.log(JSON.stringify({ result: "PASS", packagePath, sessionID, modelCalls, continuationCalls, status: state!.goals[sessionID]!.status, autoTurns: state!.goals[sessionID]!.autoTurns, artifacts: root }, null, 2))
+  const summary = {
+    result: "PASS",
+    packagePath,
+    sessionID,
+    modelCalls,
+    continuationCalls,
+    status: state!.goals[sessionID]!.status,
+    autoTurns: state!.goals[sessionID]!.autoTurns,
+    artifacts: root,
+  }
+  console.log(JSON.stringify(summary, null, 2))
+  passed = true
 } finally {
   child.kill()
   await child.exited
   await readers
   await writeFile(join(root, "server.log"), output)
   model.stop(true)
+  // On failure, preserve diagnostics before the temp root disappears: a bare
+  // timeout cannot say which final condition was stuck, and CI uploads the
+  // copied directory as an artifact via OPENCODE_SMOKE_ARTIFACTS_DIR.
+  if (!passed) {
+    try {
+      const summary = {
+        failed: true,
+        stage: lastStage ?? "unknown",
+        modelCalls,
+        continuationCalls,
+        deadlineAtMs: deadline,
+        finishedAt: Date.now(),
+      }
+      await writeFile(join(root, "failure-summary.json"), JSON.stringify(summary))
+      const artifactsDir = process.env.OPENCODE_SMOKE_ARTIFACTS_DIR
+      if (artifactsDir) {
+        await mkdir(artifactsDir, { recursive: true })
+        await cp(root, artifactsDir, { recursive: true })
+      }
+    } catch (error) {
+      // Artifact preservation must never mask the original failure.
+      console.error(`Failed to preserve smoke artifacts: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
 }

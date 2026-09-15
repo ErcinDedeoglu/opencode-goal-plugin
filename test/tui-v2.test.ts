@@ -1,9 +1,9 @@
 import { expect, test } from "bun:test"
-import { DEFAULT_THEME, resolveThemeDocument, type ResolvedTheme } from "@opencode-ai/theme/tui"
+import { DEFAULT_THEME, resolveThemeDocument, type ResolvedTheme } from "@opencode/theme/tui"
 import { testRender } from "@opentui/solid"
 import { createSignal } from "solid-js"
 import { createStore, type Store } from "solid-js/store"
-import type { SessionMessageAssistantTool, SessionMessageInfo } from "@opencode-ai/client"
+import type { SessionMessageAssistantTool, SessionMessageInfo } from "@opencode/client"
 import plugin, {
   goalFromV2Messages,
   liveTimeUsedSeconds,

@@ -1,6 +1,6 @@
 import type { TuiCommand, TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
-import type { Plugin as TuiPluginV2 } from "@opencode-ai/plugin-v2/tui"
-import type { SessionMessageInfo } from "@opencode-ai/client"
+import type { Plugin as TuiPluginV2 } from "@opencode/plugin/tui"
+import type { SessionMessageInfo } from "@opencode/client"
 import { createElement, insert, setProp } from "@opentui/solid"
 import { createEffect, createMemo, createSignal, onCleanup } from "solid-js"
 
