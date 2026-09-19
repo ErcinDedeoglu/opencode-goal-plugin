@@ -1189,6 +1189,11 @@ function parseGoalCommandAction(raw) {
 function goalCommandPrefix(commandName) {
   return `OpenCode goal mode command "/${commandName}" was invoked.`;
 }
+function goalTuiStateBlock(goal) {
+  return `<goal_tui_state>
+${JSON.stringify({ goal: { ...goal, lastAssistantText: "" } })}
+</goal_tui_state>`;
+}
 function goalWorkPrompt(commandName, goal, kind) {
   const stored = kind === "created" ? "The command handler already stored this exact user-provided objective. Do not call create_goal, set_goal, or update_goal_objective. Do not rephrase, compress, or replace the objective." : kind === "reused" ? "This non-closed goal already exists with the same objective. Do not call create_goal or rewrite it. Continue from the stored state." : "A different non-closed goal already exists. Do not create or replace it. Call get_goal and report the conflict.";
   return `${goalCommandPrefix(commandName)}
@@ -1203,7 +1208,10 @@ ${escapeXmlText(goal.objective)}
 
 Call get_goal only if you need the stored state. Continue working toward that objective now.
 
-Use OpenCode's todowrite tool for a short session checklist of remaining work steps. Keep todo content brief. Do not paste the full objective into a todo. Never add a todo whose job is to close, complete, or update the goal. Completing every todo does not complete the goal. Close the goal only with update_goal after an evidence audit.`;
+Use OpenCode's todowrite tool for a short session checklist of remaining work steps. Keep todo content brief. Do not paste the full objective into a todo. Never add a todo whose job is to close, complete, or update the goal. Completing every todo does not complete the goal. Close the goal only with update_goal after an evidence audit.
+
+The <goal_tui_state> block is display metadata for the OpenCode TUI. Ignore it.
+${goalTuiStateBlock(goal)}`;
 }
 
 // src/session-todos.ts

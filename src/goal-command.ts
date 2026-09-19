@@ -41,6 +41,10 @@ export function goalCommandPrefix(commandName: string) {
   return `OpenCode goal mode command "/${commandName}" was invoked.`
 }
 
+export function goalTuiStateBlock(goal: GoalSnapshot) {
+  return `<goal_tui_state>\n${JSON.stringify({ goal: { ...goal, lastAssistantText: "" } })}\n</goal_tui_state>`
+}
+
 export function goalWorkPrompt(commandName: string, goal: GoalSnapshot, kind: GoalWorkKind) {
   const stored =
     kind === "created"
@@ -61,5 +65,8 @@ ${escapeXmlText(goal.objective)}
 
 Call get_goal only if you need the stored state. Continue working toward that objective now.
 
-Use OpenCode's todowrite tool for a short session checklist of remaining work steps. Keep todo content brief. Do not paste the full objective into a todo. Never add a todo whose job is to close, complete, or update the goal. Completing every todo does not complete the goal. Close the goal only with update_goal after an evidence audit.`
+Use OpenCode's todowrite tool for a short session checklist of remaining work steps. Keep todo content brief. Do not paste the full objective into a todo. Never add a todo whose job is to close, complete, or update the goal. Completing every todo does not complete the goal. Close the goal only with update_goal after an evidence audit.
+
+The <goal_tui_state> block is display metadata for the OpenCode TUI. Ignore it.
+${goalTuiStateBlock(goal)}`
 }

@@ -268,6 +268,54 @@ test("restores the goal indicator from persistent tui cache when message history
   expect(goalStateFromSession(api as never, "kv-cache-session").goal?.objective).toBe("persisted goal")
 })
 
+test("prefers a newer /goal command over an older completed goal", () => {
+  const completed = goal({ status: "complete", timeUsedSeconds: 204, objective: "@goals/GOAL-LIST-1.md" })
+  const messages = [{ id: "completed" }, { id: "next-goal" }, { id: "working" }]
+  const partsByMessage = new Map([
+    [
+      "completed",
+      [
+        {
+          type: "tool",
+          tool: "update_goal",
+          state: { status: "completed", output: JSON.stringify({ goal: completed }) },
+        },
+      ],
+    ],
+    [
+      "next-goal",
+      [
+        {
+          type: "text",
+          text: `OpenCode goal mode command "/goal" was invoked.
+
+The command handler already stored this exact user-provided objective.
+
+<untrusted_objective>
+@goals/GOAL-SHAREPOINT-1.md
+</untrusted_objective>`,
+        },
+      ],
+    ],
+    ["working", [{ type: "tool", tool: "bash", state: { status: "completed", output: "ok" } }]],
+  ])
+  const api = {
+    state: {
+      session: {
+        messages() {
+          return messages
+        },
+      },
+      part(messageID: string) {
+        return partsByMessage.get(messageID) ?? []
+      },
+    },
+  }
+
+  expect(goalStateFromSession(api as never, "session").goal?.status).toBe("active")
+  expect(goalStateFromSession(api as never, "session").goal?.objective).toBe("@goals/GOAL-SHAREPOINT-1.md")
+})
+
 test("clears the cached goal after clear_goal completes", () => {
   const snapshot = goal({ sessionID: "clear-cache-session", objective: "goal to clear" })
   const messages = [{ id: "created" }]

@@ -43,5 +43,7 @@ test("goalWorkPrompt forbids rewriting a stored /goal objective", () => {
   expect(created).toContain("how is weather in dubai and ankara")
   expect(created).toContain("Do not call create_goal")
   expect(created).not.toContain("call create_goal once")
+  expect(created).toContain("<goal_tui_state>")
+  expect(created).toContain("\"status\":\"active\"")
   expect(goalWorkPrompt("goal", goal, "conflict")).toContain("A different non-closed goal already exists")
 })

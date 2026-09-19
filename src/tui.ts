@@ -50,6 +50,7 @@ type GoalSnapshot = {
 type GoalToolPart = {
   type: string
   tool?: string
+  text?: string
   state?: {
     status?: string
     output?: string
@@ -346,21 +347,98 @@ function isGoalSnapshot(value: unknown): value is GoalSnapshot {
   return true
 }
 
-function parseGoalToolOutput(part: GoalToolPart): GoalSnapshot | null | undefined {
-  if (part.type !== "tool") return undefined
-  if (!GOAL_TOOL_NAMES.includes(part.tool ?? "")) return undefined
-  if (part.state?.status !== "completed") return undefined
-  if (part.tool === "clear_goal") return null
-  if (typeof part.state.output !== "string") return undefined
-
+function parseGoalPayload(raw: string): GoalSnapshot | null | undefined {
   try {
-    const parsed: unknown = JSON.parse(part.state.output)
+    const parsed: unknown = JSON.parse(raw)
     if (!isRecord(parsed)) return undefined
     if (parsed.goal === null) return null
     return isGoalSnapshot(parsed.goal) ? parsed.goal : undefined
   } catch {
     return undefined
   }
+}
+
+function unescapeXmlText(input: string) {
+  return input.replaceAll("&lt;", "<").replaceAll("&gt;", ">").replaceAll("&amp;", "&")
+}
+
+function extractTaggedBlock(text: string, tag: string) {
+  const open = `<${tag}>`
+  const close = `</${tag}>`
+  const start = text.indexOf(open)
+  if (start < 0) return undefined
+  const contentStart = start + open.length
+  const end = text.indexOf(close, contentStart)
+  if (end < 0) return undefined
+  return text.slice(contentStart, end)
+}
+
+function epochSecondsFromCreated(created: number) {
+  if (!Number.isFinite(created) || created <= 0) return undefined
+  return created > 1e12 ? Math.floor(created / 1000) : Math.floor(created)
+}
+
+function snapshotFromCommandObjective(sessionID: string, objective: string, sampledAt?: number): GoalSnapshot {
+  const now = sampledAt ?? currentEpochSeconds()
+  return {
+    sessionID,
+    objective,
+    status: "active",
+    tokenBudget: null,
+    tokensUsed: 0,
+    timeUsedSeconds: 0,
+    createdAt: now,
+    updatedAt: now,
+    completionEvidence: null,
+    blocker: null,
+    closedAt: null,
+    continuationFailures: 0,
+    lastStatus: "Goal set.",
+    maxAutoTurns: null,
+    maxDurationSeconds: null,
+    noProgressTokenThreshold: null,
+    maxNoProgressTurns: null,
+    noProgressTurns: 0,
+    budgetWrapupSent: false,
+    stopReason: null,
+    history: [],
+    checkpoints: [],
+    lastCheckpoint: null,
+    lastAssistantText: "",
+    lastAssistantMessageID: "",
+    autoTurns: 0,
+    lastContinuationAt: null,
+    remainingTokens: null,
+    sampledAt,
+  }
+}
+
+export function parseGoalFromCommandText(text: string, sessionID: string, sampledAt?: number): GoalSnapshot | undefined {
+  const tagged = extractTaggedBlock(text, "goal_tui_state")
+  if (tagged != null) {
+    const fromTag = parseGoalPayload(tagged.trim())
+    if (fromTag) return fromTag
+  }
+  if (!text.includes("OpenCode goal mode command") || !text.includes("<untrusted_objective>")) return undefined
+  const objective = /<untrusted_objective>\r?\n?([\s\S]*?)\r?\n?<\/untrusted_objective>/.exec(text)?.[1]
+  if (objective == null) return undefined
+  const value = unescapeXmlText(objective).trim()
+  if (!value) return undefined
+  return snapshotFromCommandObjective(sessionID, value, sampledAt)
+}
+
+function parseGoalToolOutput(part: GoalToolPart): GoalSnapshot | null | undefined {
+  if (part.type !== "tool") return undefined
+  if (!GOAL_TOOL_NAMES.includes(part.tool ?? "")) return undefined
+  if (part.state?.status !== "completed") return undefined
+  if (part.tool === "clear_goal") return null
+  if (typeof part.state.output !== "string") return undefined
+  return parseGoalPayload(part.state.output)
+}
+
+function parseGoalTextPart(part: GoalToolPart, sessionID: string): GoalSnapshot | undefined {
+  if (part.type !== "text" || typeof part.text !== "string") return undefined
+  return parseGoalFromCommandText(part.text, sessionID)
 }
 
 export function goalStateFromSession(api: TuiPluginApi, sessionID: string): GoalSessionState {
@@ -370,10 +448,15 @@ export function goalStateFromSession(api: TuiPluginApi, sessionID: string): Goal
     if (!message) continue
     const parts = [...api.state.part(message.id)].reverse() as GoalToolPart[]
     for (const part of parts) {
-      const goal = parseGoalToolOutput(part)
-      if (goal !== undefined) {
-        cacheGoal(api, sessionID, goal)
-        return { goal, messageIndex }
+      const fromTool = parseGoalToolOutput(part)
+      if (fromTool !== undefined) {
+        cacheGoal(api, sessionID, fromTool)
+        return { goal: fromTool, messageIndex }
+      }
+      const fromText = parseGoalTextPart(part, sessionID)
+      if (fromText !== undefined) {
+        cacheGoal(api, sessionID, fromText)
+        return { goal: fromText, messageIndex }
       }
     }
   }
@@ -484,10 +567,16 @@ const tui: TuiPlugin = async (api) => {
  * `undefined` when no goal tool output is present (so callers can fall back to
  * a cached snapshot), `null` after a completed clear_goal, or the snapshot.
  */
-export function goalFromV2Messages(messages: readonly SessionMessageInfo[]): GoalSnapshot | null | undefined {
+export function goalFromV2Messages(messages: readonly SessionMessageInfo[], sessionID = ""): GoalSnapshot | null | undefined {
   for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
     const message = messages[messageIndex]
-    if (!message || message.type !== "assistant") continue
+    if (!message) continue
+    if (message.type === "user") {
+      const fromCommand = parseGoalFromCommandText(message.text, sessionID, epochSecondsFromCreated(message.time.created))
+      if (fromCommand) return fromCommand
+      continue
+    }
+    if (message.type !== "assistant") continue
     const parts = message.content
     for (let partIndex = parts.length - 1; partIndex >= 0; partIndex -= 1) {
       const part = parts[partIndex]
@@ -497,14 +586,8 @@ export function goalFromV2Messages(messages: readonly SessionMessageInfo[]): Goa
       if (part.name === "clear_goal") return null
       const textContent = part.state.content.find((entry) => entry.type === "text")
       if (!textContent) continue
-      try {
-        const parsed: unknown = JSON.parse(textContent.text)
-        if (!isRecord(parsed)) continue
-        if (parsed.goal === null) return null
-        if (isGoalSnapshot(parsed.goal)) return parsed.goal
-      } catch {
-        // Malformed tool output: keep scanning older tool entries.
-      }
+      const parsed = parseGoalPayload(textContent.text)
+      if (parsed !== undefined) return parsed
     }
   }
   return undefined
@@ -558,7 +641,7 @@ function GoalSidebarV2(api: TuiPluginV2.Context, sessionID: string) {
     initial: { goal: null },
   })
   const goal = createMemo<GoalSnapshot | null>(() => {
-    const found = goalFromV2Messages(api.data.session.message.list(sessionID))
+    const found = goalFromV2Messages(api.data.session.message.list(sessionID), sessionID)
     return found === undefined ? cache.goal : found
   })
   createEffect(() =>
@@ -612,7 +695,7 @@ function GoalKeymapLayerV2(api: TuiPluginV2.Context) {
             toastV2(api, "Open a session before viewing goal state.", "warning")
             return
           }
-          void showSummaryV2(api, sessionID, goalFromV2Messages(api.data.session.message.list(sessionID)) ?? null)
+          void showSummaryV2(api, sessionID, goalFromV2Messages(api.data.session.message.list(sessionID), sessionID) ?? null)
         },
       },
     ],
